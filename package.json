@@ -1,0 +1,13 @@
+{
+  "name": "chefs-remix",
+  "private": true,
+  "version": "3.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^6.3.5"
+  }
+}

@@ -1,0 +1,10 @@
+# build/working artifacts — index.html is the self-contained source of truth
+src_work/
+.playwright-mcp/
+manifest_raw.txt
+template_raw.txt
+template_decoded.html
+favicon_url.txt
+repack.js
+node_modules/
+dist/
