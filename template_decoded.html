@@ -619,6 +619,9 @@ button { font-family: inherit; color: inherit; cursor: pointer; border: none; ba
 .trow.sample { cursor: grab; }
 .trow.sample:active { cursor: grabbing; }
 .trow.sample .swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; box-shadow: 0 0 5px currentColor; }
+.trow .ttype { flex: none; display: inline-flex; align-items: center; opacity: 0.7; }
+.trow.sample:hover .ttype { opacity: 1; }
+.ce-classbadge { margin-left: 8px; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--surface-3)); border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--hairline)); vertical-align: middle; }
 .trow.sample .tname { color: var(--text); font-size: 11px; }
 .trow.sample .tplay { margin-left: auto; color: var(--faint); opacity: 0; flex: none; display: grid; place-items: center; }
 .trow.sample:hover .tplay { opacity: 1; color: var(--accent); }
@@ -792,6 +795,11 @@ button { font-family: inherit; color: inherit; cursor: pointer; border: none; ba
 .tl-mon.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, var(--hairline)); }
 .tl-clip-wave { position: absolute; inset: 2px 1px; pointer-events: none; }
 .tl-wavebar { position: absolute; bottom: 0; width: 2px; background: linear-gradient(180deg, var(--accent-2), var(--accent)); border-radius: 1px; opacity: 0.92; }
+/* Pass 5: melodic midi clips render a waveform (tinted with the lane color via inline bg) */
+.tl-clip-wave.melodic { inset: 2px 2px; align-items: center; }
+.tl-clip-wave.melodic .tl-wavebar { bottom: 50%; transform: translateY(50%); opacity: 0.85; border-radius: 1px; }
+.tl-clip.melodic .tl-clip-notes { display: none; }
+.tl-typeglyph { flex: none; display: inline-flex; align-items: center; opacity: 0.85; }
 .tl-clip.recording { border-color: #ff5470 !important; box-shadow: 0 0 12px rgba(255,84,112,0.5); background: color-mix(in srgb, #ff5470 12%, var(--surface-2)) !important; z-index: 6; }
 .tl-countin { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; pointer-events: none; }
 .tl-countin-ring { width: 120px; height: 120px; border-radius: 50%; border: 3px solid var(--accent); box-shadow: 0 0 40px color-mix(in srgb, var(--accent) 60%, transparent); animation: countin-pulse 0.5s ease-out; }

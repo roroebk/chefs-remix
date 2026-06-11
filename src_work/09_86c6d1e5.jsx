@@ -54,6 +54,20 @@
   // Reads/writes window.engine.timeline.clips directly; engine hooks stay dormant.
   // ===========================================================================
   var TL_HEAD = 130, TL_RULER = 24, TL_LANE = 36;
+  // Feature Pass 5: per-clip note-waveform cache (kept OFF the clip object so it's never serialized;
+  // recomputed lazily only when a clip's notes actually change — keyed by a cheap notes signature,
+  // so render/scroll/playback never recompute, and an edit auto-refreshes on the next render).
+  var _clipPeakCache = {};
+  function clipWavePeaks(clip) {
+    var notes = clip.notes || [];
+    var sig = 0; for (var i = 0; i < notes.length; i++) { var n = notes[i]; sig += (n.pitchTick || 0) + (n.lenTicks || 0) + (n.vel || 0) * 7 + (n.pitch || 0) * 31; }
+    var key = clip.lengthTicks + "|" + notes.length + "|" + sig;
+    var c = _clipPeakCache[clip.id];
+    if (c && c.key === key) return c.peaks;
+    var peaks = window.engine.clipNotePeaks(clip, 256);
+    _clipPeakCache[clip.id] = { key: key, peaks: peaks };
+    return peaks;
+  }
   function Timeline(props) {
     var useState = React.useState, useRef = React.useRef, useEffect = React.useEffect;
     var E = window.engine, PPQ = E.PPQ, TPB = E.TICKS_PER_BAR, SNAP = E.SNAP_TICKS;
@@ -214,21 +228,27 @@
       var tint = "linear-gradient(180deg, rgba(157,78,221,0.025), transparent)";
       return [sub, beat, bar, tint].join(", ");
     }
-    function peakBars(peaks, w) {
+    function peakBars(peaks, w, color) {
       if (!peaks || !peaks.length) return null;
       var n = Math.max(1, Math.min(peaks.length, Math.floor(w / 2))), step = peaks.length / n, a = [];
-      for (var i = 0; i < n; i++) { var p = peaks[Math.floor(i * step)] || 0; a.push(h("div", { key: i, className: "tl-wavebar", style: { left: (i * 2) + "px", height: Math.max(8, p * 100) + "%" } })); }
+      for (var i = 0; i < n; i++) { var p = peaks[Math.floor(i * step)] || 0; var st = { left: (i * 2) + "px", height: Math.max(8, p * 100) + "%" }; if (color) { st.background = color; } a.push(h("div", { key: i, className: "tl-wavebar", style: st })); }
       return a;
     }
     function clipEl(c, lane) {
       var x = t2x(c.startTick), w = Math.max(7, t2x(c.lengthTicks)), seld = sel.indexOf(c.id) >= 0, isAudio = c.kind === "audio";
+      // Feature Pass 5: a MELODIC midi clip (tonal channel, has notes) renders a real waveform —
+      // the same visual language as recorded/imported audio — instead of the note-dot preview.
+      // Percussive midi clips keep the note-dot read; audio clips are untouched.
+      var melodic = !isAudio && (c.notes && c.notes.length) && window.engine.classifyChannel(c.ch) === "melodic";
       var inner = isAudio
         ? h("div", { className: "tl-clip-wave" }, peakBars(c.peaks, w))
-        : h("div", { className: "tl-clip-notes" }, (c.notes || []).map(function (n, ni) {
-            var yy = 3 + ((23 - (((n.pitch || 0) % 24))) / 24) * (TL_LANE - 16);
-            return h("div", { key: ni, className: "tl-note", style: { left: t2x(n.pitchTick), width: Math.max(2, t2x(n.lenTicks) - 1), top: yy } });
-          }));
-      return h("div", { key: c.id, className: "tl-clip" + (seld ? " sel" : "") + (isAudio ? " audio" : ""),
+        : melodic
+          ? h("div", { className: "tl-clip-wave melodic" }, peakBars(clipWavePeaks(c), w, lane.color || "var(--accent)"))
+          : h("div", { className: "tl-clip-notes" }, (c.notes || []).map(function (n, ni) {
+              var yy = 3 + ((23 - (((n.pitch || 0) % 24))) / 24) * (TL_LANE - 16);
+              return h("div", { key: ni, className: "tl-note", style: { left: t2x(n.pitchTick), width: Math.max(2, t2x(n.lenTicks) - 1), top: yy } });
+            }));
+      return h("div", { key: c.id, className: "tl-clip" + (seld ? " sel" : "") + (isAudio ? " audio" : "") + (melodic ? " melodic" : ""),
         style: { left: x, width: w, background: isAudio ? null : "color-mix(in srgb," + (lane.color || "var(--accent)") + " 26%, var(--surface-2))", borderColor: lane.color || "var(--accent)" },
         onMouseDown: function (e) { onClipDown(e, c); },
         onDoubleClick: function (e) { e.stopPropagation(); (props.onEditClip || props.onOpenClipFx) && (props.onEditClip ? props.onEditClip(c) : props.onOpenClipFx(c)); },
@@ -360,6 +380,11 @@
             var row = h("div", { className: "tl-row", style: { height: TL_LANE } },
               h("div", { className: "tl-head", style: { width: TL_HEAD } },
                 h("span", { className: "tl-led", style: { background: lane.color } }),
+                (function () {
+                  // instrument/melody glyph — drum for percussive lanes, note for melodic (Pass 5 T1)
+                  var mel = E.classifyChannel(lane.id) === "melodic";
+                  return h("span", { className: "tl-typeglyph", title: mel ? "Melody (tonal)" : "Instrument (percussive)", style: { color: lane.color } }, h(mel ? I.Note : I.Drum, { width: 12, height: 12 }));
+                })(),
                 h("span", { className: "tl-lname" }, lane.label),
                 // inline track mix controls — mute + volume, bound straight to the engine channel state
                 (function () {

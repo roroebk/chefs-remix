@@ -28,6 +28,7 @@
     Disc: function (p) { return svg(p, [h("circle", { key: 1, cx: 12, cy: 12, r: 9 }), h("circle", { key: 2, cx: 12, cy: 12, r: 2.4, fill: "currentColor" })]); },
     Knob: function (p) { return svg(p, [h("circle", { key: 1, cx: 12, cy: 12, r: 8 }), P("M12 5v4")]); },
     Note: function (p) { return svg(p, [h("circle", { key: 1, cx: 7, cy: 17, r: 3 }), P("M10 17V5l9-2v12"), h("circle", { key: 2, cx: 16, cy: 15, r: 3 })]); },
+    Drum: function (p) { return svg(p, [h("ellipse", { key: 1, cx: 12, cy: 8, rx: 8, ry: 3 }), P("M4 8v8c0 1.7 3.6 3 8 3s8-1.3 8-3V8"), P("M16 5l4-2M8 5L4 3")]); },
     Folder: function (p) { return svg(p, P("M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z")); },
     Mic: function (p) { return svg(p, [h("rect", { key: 1, x: 9, y: 3, width: 6, height: 11, rx: 3 }), P("M5 11a7 7 0 0014 0M12 18v3")]); },
     Monitor: function (p) { return svg(p, [h("rect", { key: 1, x: 3, y: 4, width: 18, height: 12, rx: 2 }), P("M8 20h8M12 16v4")]); },

@@ -561,6 +561,53 @@
   // restore one sampler lane's audio from IndexedDB -> decode -> map onto the live buffer key.
   // Fully error-isolated: a missing/corrupt entry logs a warning and leaves the lane silent;
   // it never throws into hydrate(), so the rest of the project always loads cleanly.
+  // ---- instrument/melody classification (Feature Pass 5) --------------------
+  // single source of truth — every UI surface (browser glyphs, lane headers, clip rendering,
+  // clip-editor label) calls these rather than re-deriving from type/tonal ad hoc.
+  // a channel is percussive (one-shot drum voice) or melodic (tonal/pitched/sample).
+  Engine.prototype.classifyChannel = function (id) {
+    var def = (this.channels[id] && this.channels[id].def) || this.channelDefs.filter(function (c) { return c.id === id; })[0] || (id && id.type ? id : null);
+    if (!def) return "percussive";
+    var PERC = { kick: 1, snare: 1, clap: 1, chat: 1, ohat: 1, anvil: 1, rim: 1, shaker: 1 };
+    if (PERC[def.type]) return "percussive";
+    if (def.type === "audio" || def.type === "sampler") return "melodic";   // recorded/loaded sounds read as melodic
+    return def.tonal ? "melodic" : "percussive";
+  };
+  // a pattern bank is drums (steps only) / melody (piano-roll notes only) / hybrid (both) / empty.
+  Engine.prototype.classifyPattern = function (bankIndex) {
+    var bank = this.banks[bankIndex]; if (!bank) return "empty";
+    var hasSteps = false;
+    for (var cid in bank.steps) { var col = bank.steps[cid]; if (!col) continue; for (var i = 0; i < col.length; i++) { if (col[i].on) { hasSteps = true; break; } } if (hasSteps) break; }
+    var hasNotes = !!(bank.notes && bank.notes.length);
+    if (hasSteps && hasNotes) return "hybrid";
+    if (hasNotes) return "melody";
+    if (hasSteps) return "drums";
+    return "empty";
+  };
+  // synthesize a waveform-like peak envelope from a timeline clip's NOTES (no offline render):
+  // each note contributes a velocity-scaled attack/decay bump across start..start+len; overlaps
+  // stack, then normalize. Fast + deterministic — recomputed only when the notes change, never
+  // serialized, never run in the playback loop. Reads clearly as a waveform, not a step grid.
+  Engine.prototype.clipNotePeaks = function (clip, cols) {
+    cols = cols || 256; var notes = (clip && clip.notes) || [], total = clip && clip.lengthTicks;
+    if (!notes.length || !total) return [];
+    var arr = []; for (var z = 0; z < cols; z++) arr.push(0);
+    notes.forEach(function (n) {
+      var s = (n.pitchTick || 0) / total, e = ((n.pitchTick || 0) + (n.lenTicks || 0)) / total;
+      var vel = (n.vel == null ? 100 : n.vel) / 127;
+      var c0 = Math.max(0, Math.floor(s * cols)), c1 = Math.min(cols - 1, Math.ceil(e * cols));
+      for (var c = c0; c <= c1; c++) {
+        var t = (c - c0) / Math.max(1, c1 - c0);                 // 0..1 along the note
+        var env = Math.exp(-t * 2.2) * (1 - Math.exp(-t * 14)); // pluck-like attack/decay
+        var v = vel * (0.45 + 0.55 * env);
+        if (v > arr[c]) arr[c] = v;                              // peak stacking
+      }
+    });
+    var mx = 0; for (var k = 0; k < cols; k++) if (arr[k] > mx) mx = arr[k];
+    if (mx > 0) for (var k2 = 0; k2 < cols; k2++) arr[k2] /= mx;
+    return arr;
+  };
+
   // Task 4: downsampled peak envelope (max-abs amplitude per column) from a decoded AudioBuffer.
   // Computed ONCE then cached on clip.peaks (NOT serialized — recomputed on load); the timeline
   // re-buckets this cached array to any width, so the raw buffer is never re-walked on render.

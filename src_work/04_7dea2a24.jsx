@@ -198,6 +198,11 @@
       },
         h("span", { className: "tcaret" }),
         h("span", { className: "swatch", style: { background: node.color } }),
+        (function () {
+          // Pass 5 T1: type glyph — note for melodic/tonal sounds, drum for percussive one-shots
+          var mel = window.engine.classifyChannel(node) === "melodic";
+          return h("span", { className: "ttype", style: { color: node.color }, title: mel ? "Melody (tonal)" : "Instrument (percussive)" }, h(mel ? I.Note : I.Drum, { width: 12, height: 12 }));
+        })(),
         h("span", { className: "tname" }, node.name),
         pathLabel ? h("span", { className: "tpath" }, pathLabel) : null,
         h("span", { className: "tplay" }, h(I.Play, { width: 11, height: 11 })));
