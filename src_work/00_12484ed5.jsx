@@ -1248,8 +1248,31 @@
     // extra SRC stage and keeps the bounce sample-accurate against monitoring. WAV header below
     // writes buffer.sampleRate, so a 48k render yields a valid 48k file.
     var sr = (this.ctx && this.ctx.sampleRate) ? this.ctx.sampleRate : 44100;
-    var songTicks = this.recomputeTimelineLength();
-    var dur = this.tickToSec(songTicks) + 1.8;
+    // EXPORT LENGTH (D1): bounce the ACTUAL arrangement extent, not recomputeTimelineLength()'s
+    // 32-bar canvas floor (that minimum is for the editor; using it here padded short loops with
+    // ~60s of trailing silence). Clip ends bound every scheduled event — MIDI notes live inside
+    // clips, untrimmed audio clips have lengthTicks=secToTick(duration); note releases ride the
+    // tail below. Computed locally so we never mutate live timeline state during a render.
+    var songTicks = 0;
+    this.timeline.clips.forEach(function (c) { var e = (c.startTick || 0) + (c.lengthTicks || 0); if (e > songTicks) songTicks = e; });
+    // RENDER TAIL (D2): size the post-song tail to the longest active delay's decay-to--60dB
+    // instead of a fixed 1.8s (which clipped aggressive delay/chorus feedback). Floor at 1.8s so
+    // note releases always fit, hard-cap at 12s so runaway feedback can't balloon the buffer.
+    // Same delayish detection as the insert builder below; must run before octx (dur sets length).
+    var fxTail = 0;
+    this.insertDefs.forEach(function (def) {
+      var live = self.inserts[def.id]; if (!live) return;
+      live.fx.forEach(function (s) {
+        if (!s.type || s.bypass) return;
+        if (s.type === "delay") {
+          var t = s.params.time || 0.3, fb = Math.min(0.95, Math.max(0, s.params.fb || 0));
+          var reps = fb > 0.01 ? (3 / Math.log10(1 / fb)) : 1;   // repeats to ~ -60 dB
+          var tl = t * reps; if (tl > fxTail) fxTail = tl;
+        } else if (s.type === "chorus") { if (0.1 > fxTail) fxTail = 0.1; }
+      });
+    });
+    var tail = Math.min(12, Math.max(1.8, fxTail + 0.3));
+    var dur = this.tickToSec(songTicks) + tail;
     var OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
     if (!OAC) { onDone && onDone(null); return; }
     var octx = new OAC(2, Math.ceil(sr * dur), sr);
@@ -1270,6 +1293,7 @@
       var live = self.inserts[def.id];
       var input = octx.createGain();
       var bit = octx.createWaveShaper(); var comp = octx.createDynamicsCompressor();
+      comp.attack.value = 0.005; comp.release.value = 0.15;   // F1: match live insert init (was WebAudio defaults 0.003/0.25)
       var filt = octx.createBiquadFilter(); filt.type = "lowpass"; filt.frequency.value = 20000; filt.Q.value = 0.7;
       var dry = octx.createGain(); var dl = octx.createDelay(1.5); var fb = octx.createGain(); var wet = octx.createGain();
       var fader = octx.createGain(); fader.gain.value = live.mute ? 0 : live.vol;
