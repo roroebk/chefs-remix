@@ -1243,7 +1243,11 @@
     var self = this; this.init();
     // EXPORT: offline graph mirrors live routing — bounce the TIMELINE arrangement (not the
     // legacy empty blocks, which produced silence) over the derived song length.
-    var sr = 44100;
+    // SR MATCH: render at the LIVE context's sample rate so decoded sampler/recorded buffers
+    // (which were decoded at the hardware rate, e.g. 48000) need zero resampling — avoids the
+    // extra SRC stage and keeps the bounce sample-accurate against monitoring. WAV header below
+    // writes buffer.sampleRate, so a 48k render yields a valid 48k file.
+    var sr = (this.ctx && this.ctx.sampleRate) ? this.ctx.sampleRate : 44100;
     var songTicks = this.recomputeTimelineLength();
     var dur = this.tickToSec(songTicks) + 1.8;
     var OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
@@ -1251,8 +1255,16 @@
     var octx = new OAC(2, Math.ceil(sr * dur), sr);
     var nb = octx.createBuffer(1, sr, sr), nd = nb.getChannelData(0); for (var i = 0; i < sr; i++) nd[i] = Math.random() * 2 - 1;
     var master = octx.createGain(); master.gain.value = this.master.gain.value;
+    // MASTER CHAIN PARITY (the regression fix): the LIVE master is gain -> SOFT-CLIP -> limiter
+    // (see init(): _softClipCurve, oversample "4x"). The offline render previously skipped the
+    // soft-clip and ran gain -> limiter, so stacked transients overshot the limiter's 2ms attack
+    // and hard-clipped -> the "distorted / clipping / different from smooth playback" export bug.
+    // Reconstruct the identical tanh soft-clipper here so the bounce matches monitoring exactly.
+    var softclip = octx.createWaveShaper(); softclip.curve = this._softClipCurve(); softclip.oversample = "4x";
+    // limiter settings are kept IDENTICAL to the live limiter (-2 / 0 / 20 / 0.002 / 0.12) on
+    // purpose — matching live monitoring is the goal, so we do NOT retune it to a different ceiling.
     var lim = octx.createDynamicsCompressor(); lim.threshold.value = -2; lim.knee.value = 0; lim.ratio.value = 20; lim.attack.value = 0.002; lim.release.value = 0.12;
-    master.connect(lim); lim.connect(octx.destination);
+    master.connect(softclip); softclip.connect(lim); lim.connect(octx.destination);
     var insIn = {};
     this.insertDefs.forEach(function (def) {
       var live = self.inserts[def.id];
