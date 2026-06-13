@@ -18,6 +18,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   completion text was hardcoded to "44.1 kHz"; it now reflects the actual render
   rate (e.g. 48.0 kHz), matching the exported WAV. (`f164666`)
 
+### Hardened
+- **Channel→insert routing is defensive against bad route ids.** Routing already
+  resolves inserts strictly by id (robust to non-contiguous routes left by
+  channel deletes — verified all channels stay audible with gaps), but an
+  out-of-range route from a corrupt/old saved project could throw during wiring.
+  A channel whose route has no matching insert now logs a warning and falls back
+  to a master passthrough instead of crashing or going silent.
+
 ### Changed
 - **Export length follows the actual arrangement.** Bounces now run for the real
   clip extent plus a tail instead of a fixed 32-bar minimum, so a short loop no

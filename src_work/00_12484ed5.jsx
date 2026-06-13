@@ -1038,16 +1038,27 @@
   Engine.prototype.setChannelPan = function (id, v) { this.init(); this.channels[id].pan = v; if (this.channels[id].panner) this.channels[id].panner.pan.value = v; };
   Engine.prototype.muteCh = function (id) { this.init(); this.channels[id].muted = !this.channels[id].muted; return this.channels[id].muted; };
   Engine.prototype.soloCh = function (id) { this.init(); this.channels[id].solo = !this.channels[id].solo; return this.channels[id].solo; };
-  Engine.prototype.setRoute = function (id, route) { this.init(); var ch = this.channels[id]; ch.route = route; ch.def.route = route; var tgt = this.inserts[route].input; if (ch.panner) { ch.panner.disconnect(); ch.panner.connect(tgt); } else { ch.gain.disconnect(); ch.gain.connect(tgt); } };
+  Engine.prototype.setRoute = function (id, route) { this.init(); var ch = this.channels[id]; ch.route = route; ch.def.route = route; var tgt = this._insertInput(route, id); if (ch.panner) { ch.panner.disconnect(); ch.panner.connect(tgt); } else { ch.gain.disconnect(); ch.gain.connect(tgt); } };
 
   // ---- dynamic instrument lanes ---------------------------------------------
   // build the audio nodes for one channel def: gain -> panner -> insert.input
   // build the live audio nodes for one channel def and wire to its insert
+  // ROUTING: resolve a channel's insert strictly BY ID (this.inserts is keyed by insert id, never
+  // positional) — robust to non-contiguous route ids left by channel deletes. Defensive: if a
+  // route has no matching insert (e.g. an out-of-range route from a corrupt/old saved project),
+  // warn and fall back to a master passthrough so the channel stays audible instead of throwing
+  // (which would break boot/hydrate) or going silent.
+  Engine.prototype._insertInput = function (route, chId) {
+    var ins = this.inserts[route];
+    if (ins) return ins.input;
+    console.warn("[routing] channel '" + chId + "' route " + route + " has no matching insert — falling back to master passthrough");
+    return this.master;
+  };
   Engine.prototype._wireChannel = function (c) {
     var ctx = this.ctx;
     var g = ctx.createGain(); g.gain.value = c.vol;
     var p = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
-    var target = this.inserts[c.route].input;
+    var target = this._insertInput(c.route, c.id);
     if (p) { p.pan.value = c.pan; g.connect(p); p.connect(target); } else g.connect(target);
     this.channels[c.id] = { def: c, gain: g, panner: p, vol: c.vol, pan: c.pan, muted: false, solo: false, route: c.route };
   };
