@@ -759,6 +759,14 @@ button { font-family: inherit; color: inherit; cursor: pointer; border: none; ba
 /* clip right-edge trim/chop handle */
 .tl-clip-trim { position: absolute; top: 0; right: 0; bottom: 0; width: 7px; cursor: ew-resize; z-index: 4; background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 45%, transparent)); opacity: 0; transition: opacity .1s; }
 .tl-clip:hover .tl-clip-trim, .tl-clip.sel .tl-clip-trim { opacity: 1; }
+/* Fix 1: audio-clip fade handles (top corners) + the rendered fade ramp overlays */
+.tl-fade-h { position: absolute; top: 0; width: 9px; height: 11px; z-index: 5; cursor: ew-resize; opacity: 0; transition: opacity .1s; }
+.tl-fade-h.in { left: 0; background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 70%, transparent), transparent); border-top-left-radius: 4px; }
+.tl-fade-h.out { right: 0; background: linear-gradient(225deg, color-mix(in srgb, var(--accent) 70%, transparent), transparent); border-top-right-radius: 4px; }
+.tl-clip.audio:hover .tl-fade-h, .tl-clip.audio.sel .tl-fade-h { opacity: 1; }
+.tl-fade-ramp { position: absolute; top: 0; bottom: 0; z-index: 2; pointer-events: none; }
+.tl-fade-ramp.in { left: 0; background: linear-gradient(90deg, rgba(0,0,0,0.55), transparent); border-top-left-radius: 4px; border-bottom-left-radius: 4px; }
+.tl-fade-ramp.out { right: 0; background: linear-gradient(270deg, rgba(0,0,0,0.55), transparent); border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
 /* adaptive-grid readout chip (timeline + piano roll toolbars) */
 .tl-snapchip { font-size: 9px; letter-spacing: 0.12em; color: var(--dim); background: var(--surface-3); border: 1px solid var(--hairline); border-radius: 6px; padding: 3px 8px; white-space: nowrap; }
 .tl-snapchip b { color: var(--accent); font-family: var(--mono); letter-spacing: 0; margin-left: 2px; }

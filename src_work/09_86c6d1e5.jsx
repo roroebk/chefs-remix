@@ -151,8 +151,10 @@
       function mv(ev) { var p = coords(ev); setMq({ x0: Math.min(p0.x, p.x), y0: Math.min(p0.y, p.y), x1: Math.max(p0.x, p.x), y1: Math.max(p0.y, p.y) }); }
       function up(ev) {
         window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up);
-        // normalize the rect (works for all four drag directions) in CONTENT space, then strict
-        // geometric box intersection per clip — NO lane-index shortcut. Lane vertical bounds are
+        // normalize the rect (works for all four drag directions) in CONTENT space, then STRICT
+        // CONTAINMENT per clip (Fix 4): a clip is selected only if its FULL rect — left, right,
+        // top, bottom — falls entirely inside the marquee. Partial overlap = not selected, so a
+        // drag no longer grabs background clips it merely brushes. Lane vertical bounds are
         // measured cumulatively so open (variable-height) automation strips don't drift the test.
         var p = coords(ev);
         var x1 = x2t(Math.min(p0.x, p.x)), x2 = x2t(Math.max(p0.x, p.x));
@@ -161,7 +163,7 @@
         var hit = []; clips.forEach(function (c) {
           var b = lb[c.ch]; if (!b) return;
           var clipLeft = c.startTick, clipRight = c.startTick + c.lengthTicks;
-          if (clipLeft < x2 && clipRight > x1 && b.top < y2 && b.bottom > y1) hit.push(c.id);
+          if (clipLeft >= x1 && clipRight <= x2 && b.top >= y1 && b.bottom <= y2) hit.push(c.id);
         });
         setSel(hit); setMq(null);
       }
@@ -194,6 +196,27 @@
       function up() { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); commit(); }
       window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
     }
+    // ---- Fix 1: non-destructive audio-clip fade handles (drag the top corners). Lengths are
+    // stored in ticks (tempo-locked) and clamped so in+out never exceed the clip. ----
+    function onFadeDrag(e, clip, which) {
+      if (e.button !== 0) return; e.stopPropagation(); e.preventDefault();
+      var origin = clip.startTick;
+      function mv(ev) {
+        var t = x2t(coords(ev).x);
+        if (which === "in") { var v = Math.max(0, t - origin); clip.fadeInTicks = Math.min(v, clip.lengthTicks - (clip.fadeOutTicks || 0)); }
+        else { var v2 = Math.max(0, (origin + clip.lengthTicks) - t); clip.fadeOutTicks = Math.min(v2, clip.lengthTicks - (clip.fadeInTicks || 0)); }
+        refresh();
+      }
+      function up() { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); commit(); }
+      window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+    }
+    // ---- Fix 1: per-clip gain via mouse-wheel over an audio clip (0..200%). ----
+    function onClipWheel(e, clip) {
+      if (e.ctrlKey) return;                                  // ctrl+wheel stays zoom
+      e.preventDefault(); e.stopPropagation();
+      var g = (clip.gain != null ? clip.gain : 1) + (e.deltaY < 0 ? 0.05 : -0.05);
+      clip.gain = Math.max(0, Math.min(2, Math.round(g * 100) / 100)); commit();
+    }
     // ---- double-click empty lane body -> create a 1-bar clip ----
     function onLaneDbl(e, lane) {
       if (!e.target.classList.contains("tl-body")) return;
@@ -206,6 +229,15 @@
     function doCopy() { var s = selectedClips(); if (!s.length) return; var minT = Math.min.apply(null, s.map(function (c) { return c.startTick; })); window.__tlClipboard = s.map(function (c) { return { clip: JSON.parse(JSON.stringify(c)), rel: c.startTick - minT }; }); }
     function doPaste() { var cb = window.__tlClipboard; if (!cb || !cb.length) return; var at = snap(props.playheadTick >= 0 ? props.playheadTick : 0), ids = []; cb.forEach(function (it) { var nc = JSON.parse(JSON.stringify(it.clip)); nc.id = E._newClipId(); nc.startTick = at + it.rel; clips.push(nc); ids.push(nc.id); }); setSel(ids); commit(); }
     function doDelete() { if (!sel.length) return; E.timeline.clips = clips.filter(function (c) { return sel.indexOf(c.id) < 0; }); setSel([]); commit(); }
+    // ---- Fix 1: split/slice at the playhead. Splits the selection (or, if nothing is selected,
+    // whatever clips the playhead passes through). Each clip cut into two at the playhead tick. ----
+    function doSplit() {
+      var at = props.playheadTick; if (at == null || at < 0) return;
+      var targets = sel.length ? selectedClips() : clips.filter(function (c) { return c.startTick < at && (c.startTick + c.lengthTicks) > at; });
+      var ids = [];
+      targets.forEach(function (c) { var nid = E.splitClipAt(c.id, at); if (nid) ids.push(nid); });
+      if (ids.length) { setSel(ids); commit(); }
+    }
     useEffect(function () {
       function onKey(e) {
         if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
@@ -213,6 +245,7 @@
         if (ctrl && k === "c") { doCopy(); }
         else if (ctrl && k === "v") { e.preventDefault(); doPaste(); }
         else if (k === "delete" || k === "backspace") { doDelete(); }
+        else if (k === "s" && !ctrl) { e.preventDefault(); doSplit(); }   // Fix 1: split at playhead
       }
       window.addEventListener("keydown", onKey);
       return function () { window.removeEventListener("keydown", onKey); };
@@ -248,12 +281,18 @@
               var yy = 3 + ((23 - (((n.pitch || 0) % 24))) / 24) * (TL_LANE - 16);
               return h("div", { key: ni, className: "tl-note", style: { left: t2x(n.pitchTick), width: Math.max(2, t2x(n.lenTicks) - 1), top: yy } });
             }));
+      var gainPct = Math.round((c.gain != null ? c.gain : 1) * 100);
       return h("div", { key: c.id, className: "tl-clip" + (seld ? " sel" : "") + (isAudio ? " audio" : "") + (melodic ? " melodic" : ""),
         style: { left: x, width: w, background: isAudio ? null : "color-mix(in srgb," + (lane.color || "var(--accent)") + " 26%, var(--surface-2))", borderColor: lane.color || "var(--accent)" },
         onMouseDown: function (e) { onClipDown(e, c); },
+        onWheel: isAudio ? function (e) { onClipWheel(e, c); } : null,
         onDoubleClick: function (e) { e.stopPropagation(); (props.onEditClip || props.onOpenClipFx) && (props.onEditClip ? props.onEditClip(c) : props.onOpenClipFx(c)); },
-        title: lane.label + (isAudio ? " audio take" : " clip") + " · dbl-click → Clip Editor (Steps/Notes/FX)" + (isAudio ? "" : " · ✎ edit notes") + " · drag right edge to chop/trim" },
-        h("span", { className: "tl-clip-lbl" }, isAudio ? (c.name || "Take") : lane.label),
+        title: lane.label + (isAudio ? " audio take · scroll = gain · drag top corners = fade in/out" : " clip") + " · dbl-click → Clip Editor (Steps/Notes/FX)" + (isAudio ? "" : " · ✎ edit notes") + " · drag right edge to chop/trim" },
+        h("span", { className: "tl-clip-lbl" }, (isAudio ? (c.name || "Take") : lane.label) + (isAudio && gainPct !== 100 ? "  " + gainPct + "%" : "")),
+        (isAudio && (c.fadeInTicks || 0) > 0 ? h("div", { className: "tl-fade-ramp in", style: { width: Math.max(2, t2x(c.fadeInTicks)) } }) : null),
+        (isAudio && (c.fadeOutTicks || 0) > 0 ? h("div", { className: "tl-fade-ramp out", style: { width: Math.max(2, t2x(c.fadeOutTicks)) } }) : null),
+        (isAudio ? h("div", { className: "tl-fade-h in", title: "Fade in", onMouseDown: function (e) { onFadeDrag(e, c, "in"); } }) : null),
+        (isAudio ? h("div", { className: "tl-fade-h out", title: "Fade out", onMouseDown: function (e) { onFadeDrag(e, c, "out"); } }) : null),
         (c.fx ? h("span", { className: "tl-clip-fxdot", title: "This clip has bound per-clip FX" }) : null),
         (c.routeOverride ? h("span", { className: "tl-clip-fxbadge", title: "Custom FX → Insert M" + ("0" + c.routeOverride).slice(-2) }, "FX" + c.routeOverride) : null),
         inner,
@@ -362,7 +401,8 @@
           h(I.Mic, { width: 12, height: 12 }), monitor ? "Monitor: On" : "Monitor: Off"),
         h("div", { className: "tl-tools" },
           h("button", { className: "tl-tool" + (props.tool !== "marquee" ? " on" : ""), title: "Arrow tool (V)", onClick: function () { props.onSetTool && props.onSetTool("arrow"); } }, "▸"),
-          h("button", { className: "tl-tool" + (props.tool === "marquee" ? " on" : ""), title: "Marquee tool (M) — left-drag selects", onClick: function () { props.onSetTool && props.onSetTool("marquee"); } }, "▢")),
+          h("button", { className: "tl-tool" + (props.tool === "marquee" ? " on" : ""), title: "Marquee tool (M) — left-drag selects", onClick: function () { props.onSetTool && props.onSetTool("marquee"); } }, "▢"),
+          h("button", { className: "tl-tool", title: "Split at playhead (S) — slices the selected clip(s), or whatever the playhead crosses", onClick: doSplit }, "✂")),
         h("span", { className: "tl-hint" }, "Click empties / drag the playhead to scrub · marquee a group then drag any clip to move all · trim a clip's right edge"),
         h("span", { className: "tl-snapchip", title: "Adaptive grid — subdivides automatically as you zoom" }, "GRID ", h("b", null, snapLabel())),
         h("div", { className: "tl-zoom" }, h("span", { className: "lbl" }, "ZOOM"),

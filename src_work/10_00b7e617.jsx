@@ -617,7 +617,18 @@
       h("div", { className: "stage" },
         h(Transport, { playing: playing, bpm: bpm, swing: swing, master: master, active: active, pos: posStr(playStep, playBar, mode), onPlay: togglePlay, onStop: stop, onBpm: function (v) { E.setTempo(v); setBpm(v); }, onSwing: function (v) { E.setSwing(v); setSwing(v); }, onPattern: pattern, onExport: function () { setShowEx(true); } }),
         h("div", { className: "workspace" },
-          h(window.FileBrowser, { collapsed: railCol, onCollapse: function () { setRailCol(!railCol); }, channelDefs: E.channelDefs, focus: focus, onFocus: doFocus, onPreview: previewSample, onAssign: assignSample, onCreateTrack: createTrackFromSample, toast: toast, onTrackAdded: function () { setFocus(E.focus); E.setFocus(E.focus); bump(); } }),
+          h(window.FileBrowser, { collapsed: railCol, onCollapse: function () { setRailCol(!railCol); }, channelDefs: E.channelDefs, focus: focus, onFocus: doFocus, onPreview: previewSample, onAssign: assignSample, onCreateTrack: createTrackFromSample, toast: toast, onTrackAdded: function () { setFocus(E.focus); E.setFocus(E.focus); bump(); },
+            onAddMelody: function (files) {
+              // Fix 1: decode each melody file -> full-length Audio Lane clip on the timeline.
+              var total = files.length, ok = 0;
+              files.forEach(function (f) {
+                E.decodeAudioFile(f, function (buf) {
+                  E.addMelodyFile(f.name, buf, f); ok++;
+                  setView("timeline"); setFocus(E.focus); bump();
+                  toast("Added melody: " + f.name + " (" + ok + "/" + total + ")", h(I.Wave, { width: 16, height: 16 }));
+                }, function () { toast("Could not decode " + f.name, h(I.X, { width: 16, height: 16 })); });
+              });
+            } }),
           h("div", { className: "stage-main" },
             h("div", { className: "tabs" },
               TABS.map(function (tb) { return h("button", { key: tb.id, className: "tab" + (view === tb.id ? " on" : ""), onClick: function () { setView(tb.id); setEditClip(null); } }, h("span", { className: "ti" }, h(tb.ic, { width: 16, height: 16 })), tb.label); }),

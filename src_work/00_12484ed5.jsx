@@ -93,7 +93,9 @@
   // route every channel 1:1 to its own insert (M01..M16)
   CHANNELS.forEach(function (c, i) { c.route = i + 1; });
 
-  function blankStep() { return { on: false, vel: 100, pan: 0, pitch: 0, len: 1 }; }
+  // Per-step modulation (Fix 2): pitch = semitone offset, pan = -1..1, vol = dB offset.
+  // Steps without edits keep 0/0/0 and behave exactly as before.
+  function blankStep() { return { on: false, vel: 100, pan: 0, pitch: 0, len: 1, vol: 0 }; }
   // step-maps are added per-channel by addChannel(); a fresh bank starts empty.
   // lengthBars (Task 2): per-pattern length 1..32; step rows are sized 16*lengthBars.
   function blankPattern() { return { steps: {}, notes: [], lengthBars: 1 }; }
@@ -194,26 +196,13 @@
     return c;
   };
   Engine.prototype._defaultFx = function (id) {
-    // 8 serial slots; type or null. preload several inserts with active racks
-    function pad(arr) { while (arr.length < 8) arr.push(null); return arr; }
-    var racks = {
-      1: pad([{ type: "eq" }, { type: "comp" }, { type: "limiter" }]),           // KICK
-      2: pad([{ type: "filter" }, { type: "comp" }, { type: "eq" }]),            // SUB
-      3: pad([{ type: "eq" }, { type: "comp" }, { type: "reverb" }]),            // SNARE
-      4: pad([{ type: "eq" }, { type: "reverb" }, { type: "delay" }]),           // CLAP
-      5: pad([{ type: "eq" }, { type: "filter" }]),                              // C-HAT
-      6: pad([{ type: "eq" }, { type: "reverb" }]),                              // O-HAT
-      9: pad([{ type: "bitcrush" }, { type: "filter" }, { type: "delay" }, { type: "eq" }]), // GLITCH
-      10: pad([{ type: "eq" }, { type: "delay" }, { type: "reverb" }, { type: "chorus" }]),  // VOX
-      11: pad([{ type: "chorus" }, { type: "eq" }, { type: "delay" }]),          // PLUCK
-      14: pad([{ type: "bitcrush" }, { type: "delay" }, { type: "reverb" }]),    // LEAD
-      15: pad([{ type: "filter" }, { type: "reverb" }, { type: "delay" }])       // RISER
-    };
-    var base = racks[id] || pad([{ type: "eq" }]);
-    return base.map(function (s) {
-      if (!s) return { type: null, bypass: false, params: {} };
-      return { type: s.type, bypass: false, params: defParams(s.type) };
-    });
+    // FX ZERO-STATE (Fix 2): a fresh session starts COMPLETELY DRY — every one of the 8 serial
+    // slots is empty, so there are no pre-enabled reverb/delay/chorus/feedback sends and wet mix
+    // is 0%. The insert graph already inits wet.gain=0 / fb.gain=0; with no delay/chorus slot,
+    // _applyFx keeps them at 0. Saved sessions restore their own FX racks via hydrate (zero-state
+    // defaults apply only when no saved state exists).
+    var a = []; for (var i = 0; i < 8; i++) a.push({ type: null, bypass: false, params: {} });
+    return a;
   };
   function defParams(t) {
     if (t === "bitcrush") return { bits: 6, mix: 0.7 };
@@ -315,22 +304,54 @@
   // play a decoded AudioBuffer (sampler voice). pitch via playbackRate, velocity via gain.
   // durSec/offsetSec (optional) trim playback to a clip window — used for tempo-bound chopping
   // on the timeline (both are derived from ticks via tickToSec, so they track the active BPM).
-  Engine.prototype._playBuffer = function (ctx, buffer, t, out, semis, vel, durSec, offsetSec) {
+  Engine.prototype._playBuffer = function (ctx, buffer, t, out, semis, vel, durSec, offsetSec, opts) {
     if (!buffer) return;
+    opts = opts || {};
     var src = ctx.createBufferSource(); src.buffer = buffer;
-    src.playbackRate.value = Math.pow(2, (semis || 0) / 12);
-    var g = ctx.createGain(); g.gain.value = (vel == null ? 100 : vel) / 127;
-    src.connect(g); g.connect(out);
+    var rate = Math.pow(2, (semis || 0) / 12); src.playbackRate.value = rate;
+    var g = ctx.createGain();
+    var baseGain = ((vel == null ? 100 : vel) / 127) * (opts.gain != null ? opts.gain : 1);
     var off = Math.max(0, offsetSec || 0);
-    // playbackRate scales how much source material a clip-window of durSec consumes
-    if (durSec && durSec > 0) src.start(t, off, durSec * src.playbackRate.value); else src.start(t, off);
+    // natural play length of the remaining buffer at this rate. Fix 3: when durSec is falsy
+    // (an untrimmed Audio-Lane clip), the boundary IS the buffer end — no measure/loop clamp.
+    var natural = (buffer.duration - off) / rate;
+    var playDur = (durSec && durSec > 0) ? Math.min(durSec, natural) : natural;
+    if (!(playDur > 0)) playDur = natural;
+    // Fix 4 de-click: never hard-stop a source at non-zero gain. Always ramp the voice gain to
+    // ~0 over the last few ms (>= 8ms, or the clip's fade-out) and only stop after the ramp.
+    // A short attack ramp also removes the leading transient click on low-freq (808) voices.
+    var DECLICK = 0.008;
+    var atk = Math.min(Math.max(opts.fadeIn || 0, 0.003), playDur * 0.5);
+    var rel = Math.min(Math.max(opts.fadeOut || 0, DECLICK), playDur);
+    var atkEnd = t + atk, relStart = t + Math.max(playDur - rel, atk);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(baseGain, atkEnd);
+    g.gain.setValueAtTime(baseGain, relStart);
+    g.gain.linearRampToValueAtTime(0.0001, t + playDur);
+    src.connect(g); g.connect(out);
+    src.start(t, off);
+    try { src.stop(t + playDur + 0.02); } catch (e) {}   // tail past the release so the ramp completes
   };
-  Engine.prototype._fire = function (chId, t, semis, vel, durSec, out) {
+  // Per-step modulation node (Fix 2): wrap the voice destination with an optional gain (dB
+  // offset) + stereo pan so a single step can be louder/quieter and panned without touching the
+  // channel's own level/pan. Returns the node the voice should connect INTO. No-op when 0/0.
+  Engine.prototype._modNode = function (dest, mod) {
+    var node = dest;
+    if (mod.pan && this.ctx.createStereoPanner) {
+      var p = this.ctx.createStereoPanner(); p.pan.value = Math.max(-1, Math.min(1, mod.pan)); p.connect(dest); node = p;
+    }
+    if (mod.vol) {
+      var g = this.ctx.createGain(); g.gain.value = Math.pow(10, mod.vol / 20); g.connect(node); node = g;
+    }
+    return node;
+  };
+  Engine.prototype._fire = function (chId, t, semis, vel, durSec, out, mod) {
     var ch = this.channels[chId]; if (!ch) return;
     // ROUTING: all voices via channel insert. `out` defaults to ch.gain (-> panner ->
     // inserts[route].input). A routeOverride clip passes a one-shot send node wired to a
     // different insert (still post channel-gain), so every voice still passes an insert FX chain.
     var dest = out || ch.gain;
+    if (mod && (mod.pan || mod.vol)) dest = this._modNode(dest, mod);   // per-step pan/vol offsets
     // SCHED: single-fire guarantee — a tonal sampler voice (melodic/long sample) honors the
     // note/step length so it stops at its boundary instead of ringing on at full buffer length
     // and stacking under the next trigger (the "intense echo / slap-back" bug). Non-tonal
@@ -382,7 +403,7 @@
     var maxRoute = 0; this.channelDefs.forEach(function (c) { if (c.route > maxRoute) maxRoute = c.route; });
     var route = Math.min(16, maxRoute + 1);
     var label = (name || "Sample").replace(/\.[a-z0-9]+$/i, "").slice(0, 22);
-    var def = { id: id, label: label, type: "sampler", color: opts.color || "#C77DFF", route: route,
+    var def = { id: id, label: label, type: "sampler", kind: "sampler", color: opts.color || "#C77DFF", route: route,
                 vol: 0.9, pan: 0, tonal: opts.tonal !== false, base: opts.base != null ? opts.base : 60,
                 bufferId: id, sampleId: id, userAudio: true };
     this.channelDefs.push(def);
@@ -425,11 +446,55 @@
     this.init();
     var n = 1, id = "rec"; while (this.channels[id]) { id = "rec_" + (++n); }
     var maxRoute = 0; this.channelDefs.forEach(function (c) { if (c.route > maxRoute) maxRoute = c.route; });
-    var def = { id: id, label: name || ("Audio " + n), type: "audio", color: "#C77DFF", route: Math.min(16, maxRoute + 1), vol: 0.9, pan: 0, tonal: false, base: 0, audioLane: true };
+    var def = { id: id, label: name || ("Audio " + n), type: "audio", kind: "audioLane", color: "#C77DFF", route: Math.min(16, maxRoute + 1), vol: 0.9, pan: 0, tonal: false, base: 0, audioLane: true };
     this.channelDefs.push(def);
     this.banks.forEach(function (bk) { bk.steps[id] = freshStepRow(patLen(bk)); });
     this._wireChannel(def); this.focus = id;
     return def;
+  };
+  // ---- Fix 1: "Add Melody File" — continuous Audio Lane ingestion ------------
+  // A melody import is NOT forced into a sampler/step track. It creates a dedicated Audio Lane
+  // (kind:'audioLane') and drops a single linear clip that spans the file's TRUE length on the
+  // timeline immediately, as a waveform. It schedules sample-accurately via the transport
+  // (_fireEvent -> _playBuffer with offset), never via sequencer events / a step block. The clip
+  // carries gain + non-destructive fade handles + is splittable (see splitClipAt).
+  Engine.prototype.addMelodyFile = function (name, buffer, blob) {
+    this.init(); if (!buffer) return null;
+    var def = this.addAudioTrack((name || "Melody").replace(/\.[a-z0-9]+$/i, "").slice(0, 22));
+    var bufId = "mel_" + (++this._recSeq);
+    this.userBuffers[bufId] = buffer;
+    var clip = { id: this._newClipId(), kind: "audio", ch: def.id, startTick: 0,
+      lengthTicks: Math.max(this.SNAP_TICKS, this.secToTick(buffer.duration)),
+      bufferId: bufId, offsetTicks: 0, name: def.label, peaks: this.computePeaks(buffer),
+      gain: 1, fadeInTicks: 0, fadeOutTicks: 0, trimmed: false };   // untrimmed -> plays to natural end (no cap)
+    this.timeline.clips.push(clip);
+    this.recomputeTimelineLength();
+    if (blob) { var b = (blob instanceof Blob) ? blob : new Blob([blob]); idbPut(bufId, b)["catch"](function (e) { console.warn("[SampleDB] melody save failed:", e); }); }
+    this.focus = def.id; this._refreshTimelineEvents();
+    return { def: def, clip: clip };
+  };
+  // ---- Fix 1: split / slice a timeline clip at an absolute tick (playhead or arbitrary) ------
+  // Non-destructive: the left half keeps [start, cut), the right half takes [cut, end). Audio
+  // halves advance offsetTicks so the waveform stays continuous; midi halves partition + rebase
+  // their notes. Both halves are flagged trimmed (they now represent a windowed slice).
+  Engine.prototype.splitClipAt = function (clipId, absTick) {
+    var clips = this.timeline.clips, idx = -1;
+    for (var i = 0; i < clips.length; i++) { if (clips[i].id === clipId) { idx = i; break; } }
+    if (idx < 0) return null;
+    var c = clips[idx], origLen = c.lengthTicks, rel = Math.round(absTick) - c.startTick;
+    if (rel <= 0 || rel >= origLen) return null;                  // cut must land strictly inside
+    var right = JSON.parse(JSON.stringify(c)); right.id = this._newClipId();
+    c.lengthTicks = rel; c.trimmed = true; c.fadeOutTicks = 0;
+    right.startTick = c.startTick + rel; right.lengthTicks = origLen - rel; right.trimmed = true; right.fadeInTicks = 0;
+    if (c.kind === "audio") { right.offsetTicks = (c.offsetTicks || 0) + rel; }
+    else {
+      c.notes = (c.notes || []).filter(function (n) { return n.pitchTick < rel; });
+      right.notes = (right.notes || []).filter(function (n) { return n.pitchTick >= rel; })
+        .map(function (n) { return { pitchTick: n.pitchTick - rel, pitch: n.pitch, lenTicks: n.lenTicks, vel: n.vel }; });
+    }
+    clips.splice(idx + 1, 0, right);
+    this._refreshTimelineEvents();
+    return right.id;
   };
   // short metronome blip for the count-in (accented downbeat)
   Engine.prototype.metronomeClick = function (time, accent) {
@@ -729,7 +794,8 @@
     this.timeline.clips.forEach(function (clip) {
       var ro = clip.routeOverride || null;   // Task 4: per-clip FX route override (independent insert)
       if (clip.kind === "audio") {
-        evs.push({ absTick: clip.startTick, ch: clip.ch, kind: "audio", bufferId: clip.bufferId, offsetTicks: clip.offsetTicks || 0, lenTicks: clip.lengthTicks, clipId: clip.id, routeOverride: ro });
+        evs.push({ absTick: clip.startTick, ch: clip.ch, kind: "audio", bufferId: clip.bufferId, offsetTicks: clip.offsetTicks || 0, lenTicks: clip.lengthTicks, clipId: clip.id, routeOverride: ro,
+          gain: clip.gain != null ? clip.gain : 1, fadeInTicks: clip.fadeInTicks || 0, fadeOutTicks: clip.fadeOutTicks || 0, trimmed: !!clip.trimmed });
       } else {
         (clip.notes || []).forEach(function (n) {
           evs.push({ absTick: clip.startTick + n.pitchTick, ch: clip.ch, kind: "note", pitch: n.pitch, lenTicks: n.lenTicks, vel: n.vel, clipId: clip.id, routeOverride: ro });
@@ -782,7 +848,7 @@
       var col = bank.steps[c.id]; if (!col) return; var st = col[stepInBar]; if (!st || !st.on) return; if (!self._audible(c.id)) return;
       var swingOff = (stepInBar % 2 === 1) ? self.swing * sd * 0.5 : 0;
       var dur = c.tonal ? Math.max(st.len * sd * 0.95, 0.12) : sd;
-      self._fire(c.id, time + swingOff, st.pitch, st.vel, dur);
+      self._fire(c.id, time + swingOff, st.pitch, st.vel, dur, null, { vol: st.vol || 0, pan: st.pan || 0 });
     });
     // piano-roll notes
     bank.notes.forEach(function (nt) {
@@ -837,11 +903,15 @@
     var ch = this.channels[ev.ch]; if (!ch) return;
     var send = this._overrideSend(ch, ev.routeOverride);   // null unless the clip overrides its route
     if (ev.kind === "audio") {
-      // clip length + offset are stored in ticks, so the audible window stays locked to the
-      // current tempo — a chopped/shortened clip stops exactly on its grid boundary (no drift).
+      // Fix 3: an Audio-Lane clip is clamped to its tick-window ONLY when the user explicitly
+      // trimmed/split it — then a chop stops exactly on its grid boundary (tempo-locked, no drift).
+      // An untrimmed clip (e.g. a full melody import) passes durSec=0 so playback runs to the
+      // buffer's true duration — no measure/loop truncation. Per-clip gain + fades ride along.
       // ROUTING: all voices via channel insert
+      var dur = ev.trimmed ? this.tickToSec(ev.lenTicks) : 0;
       this._playBuffer(this.ctx, this.userBuffers[ev.bufferId], time, send || ch.gain, 0, 100,
-        this.tickToSec(ev.lenTicks), this.tickToSec(ev.offsetTicks || 0));
+        dur, this.tickToSec(ev.offsetTicks || 0),
+        { gain: ev.gain, fadeIn: this.tickToSec(ev.fadeInTicks || 0), fadeOut: this.tickToSec(ev.fadeOutTicks || 0) });
       return;
     }
     var semis = ev.pitch - (ch.def.base || 0);
@@ -1228,7 +1298,7 @@
       var c = self.channels[ev.ch]; if (!c) return;
       var time = self.tickToSec(ev.absTick);
       var out = outFor(ev.ch, ev.routeOverride);
-      if (ev.kind === "audio") { self._playBuffer(octx, self.userBuffers[ev.bufferId], time, out, 0, 100, self.tickToSec(ev.lenTicks), self.tickToSec(ev.offsetTicks || 0)); return; }
+      if (ev.kind === "audio") { var adur = ev.trimmed ? self.tickToSec(ev.lenTicks) : 0; self._playBuffer(octx, self.userBuffers[ev.bufferId], time, out, 0, 100, adur, self.tickToSec(ev.offsetTicks || 0), { gain: ev.gain, fadeIn: self.tickToSec(ev.fadeInTicks || 0), fadeOut: self.tickToSec(ev.fadeOutTicks || 0) }); return; }
       var semis = ev.pitch - (c.def.base || 0);
       var d = Math.max(ev.lenTicks * self.secPerTick() * 0.95, 0.08);
       if (c.def.type === "sampler") self._playBuffer(octx, self.userBuffers[c.def.bufferId], time, out, semis, ev.vel);
@@ -1304,7 +1374,7 @@
       activePattern: this.activePattern, focus: this.focus,
       channels: this.channelDefs.map(function (c) {
         var live = self.channels[c.id] || {};
-        return { id: c.id, label: c.label, type: c.type, color: c.color, route: c.route,
+        return { id: c.id, label: c.label, type: c.type, kind: c.kind || (c.type === "audio" ? "audioLane" : "sampler"), audioLane: !!c.audioLane, color: c.color, route: c.route,
                  base: c.base, tonal: c.tonal, sampleId: c.sampleId, bufferId: c.bufferId, userAudio: !!c.userAudio,
                  vol: live.vol != null ? live.vol : c.vol, pan: live.pan != null ? live.pan : c.pan,
                  muted: !!live.muted, solo: !!live.solo };
@@ -1312,13 +1382,16 @@
       banks: this.banks.map(function (bk) {
         var steps = {};
         for (var id in bk.steps) steps[id] = bk.steps[id].map(function (s) {
-          return { on: s.on, vel: s.vel, pan: s.pan, pitch: s.pitch, len: s.len };
+          return { on: s.on, vel: s.vel, pan: s.pan, pitch: s.pitch, len: s.len, vol: s.vol || 0 };
         });
         return { steps: steps, lengthBars: patLen(bk), notes: bk.notes.map(function (n) { return { ch: n.ch, pitch: n.pitch, start: n.start, len: n.len, vel: n.vel }; }) };
       }),
       inserts: Object.keys(this.inserts).map(function (k) {
         var ins = self.inserts[k];
-        return { id: ins.def.id, vol: ins.vol, panVal: ins.panVal, mute: ins.mute, solo: ins.solo };
+        // Fix 2 persistence: store the full 8-slot FX rack so param edits survive reload. Small
+        // (<2KB/insert), so it rides the existing localStorage autosave; restored exactly in hydrate.
+        return { id: ins.def.id, vol: ins.vol, panVal: ins.panVal, mute: ins.mute, solo: ins.solo,
+                 fx: ins.fx.map(function (s) { return { type: s.type || null, bypass: !!s.bypass, params: s.params || {} }; }) };
       }),
       timeline: { clips: this.timeline.clips, loop: this.timeline.loop, lengthTicks: this.timeline.lengthTicks, automation: this.timeline.automation }
     };
@@ -1340,16 +1413,16 @@
       this.banks = (data.banks || []).map(function (bk) {
         var p = { steps: {}, notes: (bk.notes || []).slice(), lengthBars: Math.max(1, Math.min(32, bk.lengthBars || 1)) };
         for (var id in bk.steps) p.steps[id] = bk.steps[id].map(function (s) {
-          return { on: !!s.on, vel: s.vel, pan: s.pan, pitch: s.pitch, len: s.len };
+          return { on: !!s.on, vel: s.vel, pan: s.pan, pitch: s.pitch, len: s.len, vol: s.vol || 0 };
         });
         return p;
       });
       while (this.banks.length < 4) this.banks.push(blankPattern());
       // rebuild channels + fresh nodes
       (data.channels || []).forEach(function (c) {
-        var def = { id: c.id, label: c.label, type: c.type, color: c.color, route: c.route,
+        var def = { id: c.id, label: c.label, type: c.type, kind: c.kind || (c.type === "audio" ? "audioLane" : "sampler"), color: c.color, route: c.route,
                     vol: c.vol, pan: c.pan, tonal: c.tonal, base: c.base, sampleId: c.sampleId,
-                    bufferId: c.bufferId || c.id, userAudio: !!c.userAudio };
+                    bufferId: c.bufferId || c.id, userAudio: !!c.userAudio, audioLane: c.type === "audio" || !!c.audioLane };
         self.channelDefs.push(def);
         self.banks.forEach(function (bk) { if (!bk.steps[c.id]) bk.steps[c.id] = freshStepRow(patLen(bk)); });
         self._wireChannel(def);
@@ -1363,6 +1436,13 @@
       (data.inserts || []).forEach(function (s) {
         var ins = self.inserts[s.id]; if (!ins) return;
         ins.mute = !!s.mute; ins.solo = !!s.solo;
+        // Fix 2: restore the saved FX rack exactly (zero-state dry defaults applied only when a
+        // save has no fx array, e.g. pre-Fix-2 sessions).
+        if (s.fx && s.fx.length) {
+          ins.fx = s.fx.map(function (slot) { return slot ? { type: slot.type || null, bypass: !!slot.bypass, params: slot.params || {} } : { type: null, bypass: false, params: {} }; });
+          while (ins.fx.length < 8) ins.fx.push({ type: null, bypass: false, params: {} });
+          self._applyFx(s.id);
+        }
         self.setInsertVol(s.id, s.vol); self.setInsertPan(s.id, s.panVal);
       });
       this.focus = data.focus && this.channels[data.focus] ? data.focus : (this.channelDefs[0] && this.channelDefs[0].id) || null;

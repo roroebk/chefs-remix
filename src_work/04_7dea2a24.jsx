@@ -144,6 +144,7 @@
     var qs = useState(""); var query = qs[0], setQuery = qs[1];
     var dz = useState(false); var dragOver = dz[0], setDragOver = dz[1];   // OS file drag-over highlight
     var fileRef = React.useRef(null);                                       // hidden picker for "Add File(s)"
+    var melodyRef = React.useRef(null);                                     // hidden picker for "Add Melody File" (Fix 1)
     var factory = getFactory();
 
     // dropped / picked files land in a single "Imported Files" library folder (user-root, removable).
@@ -164,6 +165,16 @@
       });
       expand(imp.id); rerender();
       props.toast && props.toast("Imported " + files.length + " file" + (files.length === 1 ? "" : "s"), h(I.Wave, { width: 16, height: 16 }));
+    }
+
+    // Fix 1 — "Add Melody File": dual-path ingestion. Unlike Add File(s) (which makes step/grid
+    // sampler rows), a melody import goes straight onto the linear timeline as a continuous Audio
+    // Lane clip (full-length waveform, no step block needed). Delegated to the host (engine.addMelodyFile).
+    function addMelodies(fileList) {
+      var files = Array.prototype.slice.call(fileList || []).filter(isMedia);
+      if (!files.length) { props.toast && props.toast("No audio/video files to add", h(I.X, null)); return; }
+      if (!props.onAddMelody) return;
+      props.onAddMelody(files);
     }
 
     // NOTE: the standalone "Import Audio" picker and sidebar "Record Mic" utility were retired —
@@ -246,8 +257,11 @@
         onDrop: function (e) { if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return; e.preventDefault(); setDragOver(false); addFiles(e.dataTransfer.files); } },
         h("div", { className: "fb-improw" },
           h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, onClick: function () { fileRef.current && fileRef.current.click(); } }, h(I.Plus, { width: 15, height: 15 }), "Add File(s)"),
-          h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, onClick: function () { setShowLink(true); } }, h(I.Folder, { width: 15, height: 15 }), "Link Folder")),
+          h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, title: "Link an instrumental/drum folder as Sampler channels (16-step grid + Piano Roll + FX)", onClick: function () { setShowLink(true); } }, h(I.Folder, { width: 15, height: 15 }), "Link Instrumental Folder")),
+        h("div", { className: "fb-improw" },
+          h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, title: "Import a melody/audio file as a continuous Audio Lane clip on the timeline (no step block)", onClick: function () { melodyRef.current && melodyRef.current.click(); } }, h(I.Wave, { width: 15, height: 15 }), "Add Melody File")),
         h("input", { type: "file", ref: fileRef, accept: "audio/*,video/*", multiple: true, style: { display: "none" }, onChange: function (e) { addFiles(e.target.files); e.target.value = ""; } }),
+        h("input", { type: "file", ref: melodyRef, accept: "audio/*,video/*", multiple: true, style: { display: "none" }, onChange: function (e) { addMelodies(e.target.files); e.target.value = ""; } }),
         h("div", { className: "fb-drophint" }, h(I.Wave, { width: 13, height: 13 }), " Drop audio or screen-recording files to import"),
         h("div", { className: "tree" },
           h("div", { className: "tree-sec" }, "LIBRARY"),
