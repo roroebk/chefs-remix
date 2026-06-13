@@ -171,7 +171,7 @@
             ? h("div", { className: "render-box" },
                 h("div", { className: "render-title mono" }, phase === "done" ? (what === "stems" ? "STEMS COMPLETE" : "MIXDOWN COMPLETE") : (what === "stems" ? "RENDERING STEMS (ZIP)…" : "RENDERING MIXDOWN (WAV)…")),
                 h("div", { className: "render-bar" }, h("div", { className: "render-fill", style: { width: Math.round(prog * 100) + "%" } })),
-                h("div", { className: "render-sub mono" }, Math.round(prog * 100) + "%  ·  44.1 kHz · 16-bit" + (what === "stems" ? " · per-track WAV" : " stereo")))
+                h("div", { className: "render-sub mono" }, Math.round(prog * 100) + "%  ·  " + (((E.ctx && E.ctx.sampleRate) || 44100) / 1000).toFixed(1) + " kHz · 16-bit" + (what === "stems" ? " · per-track WAV" : " stereo")))
             : h("div", null,
                 h("p", { style: { fontSize: 12, color: "var(--dim)", lineHeight: 1.5, marginBottom: 14 } }, "Bounce the arrangement through an OfflineAudioContext — the full master mix, or each track as a separate WAV zipped for your studio."),
                 h("div", { className: "eopt-row" },
