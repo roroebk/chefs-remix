@@ -965,7 +965,13 @@
     this.init(); this.resume(); if (mode) this.playMode = mode; if (this.isPlaying) return;
     this.isPlaying = true; this.notesInQueue = [];
     if (this.playMode === "pattern") this.stepIndex = 0;
-    else if (this.playMode === "timeline") { this.recomputeTimelineLength(); this._tlEvents = this.timelineEvents(); this.playheadTick = this.timeline.loop.on ? this.timeline.loop.startTick : 0; this._tlCursor = this._cursorForTick(this.playheadTick); }
+    // PLAYBACK PARITY: mirror every channel's current rack pattern onto the timeline before
+    // building the event list. Bulk-population paths (loadDemoChannels/buildDemo, hydrate of
+    // pre-mirror saves) fill `banks` directly without per-edit syncRackClip, so without this an
+    // instrument's pattern exists but has no timeline clip -> it stays silent in timeline mode.
+    // Idempotent (updates _rack clips in place, drops empty ones), and leaves arranged/audio clips
+    // untouched — so pressing play always plays ALL instruments that have content.
+    else if (this.playMode === "timeline") { this.syncAllRackClips(); this.recomputeTimelineLength(); this._tlEvents = this.timelineEvents(); this.playheadTick = this.timeline.loop.on ? this.timeline.loop.startTick : 0; this._tlCursor = this._cursorForTick(this.playheadTick); }
     else this.songStep = 0;
     this.nextStepTime = this.ctx.currentTime + 0.06; var self = this;
     this.timer = setInterval(function () { self._scheduler(); }, this.lookahead); this._draw();
@@ -1241,6 +1247,10 @@
   // ---- offline mixdown render -> 16-bit stereo WAV ---------------------------
   Engine.prototype.renderMixdown = function (onProgress, onDone, soloId) {
     var self = this; this.init();
+    // PLAYBACK PARITY: mirror all rack patterns onto the timeline first (same as start()), so a
+    // bounce taken before the user ever pressed play / entered the Timeline still includes every
+    // instrument that has content — the export must match what live playback now plays.
+    this.syncAllRackClips();
     // EXPORT: offline graph mirrors live routing — bounce the TIMELINE arrangement (not the
     // legacy empty blocks, which produced silence) over the derived song length.
     // SR MATCH: render at the LIVE context's sample rate so decoded sampler/recorded buffers
