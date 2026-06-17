@@ -151,11 +151,12 @@
       function mv(ev) { var p = coords(ev); setMq({ x0: Math.min(p0.x, p.x), y0: Math.min(p0.y, p.y), x1: Math.max(p0.x, p.x), y1: Math.max(p0.y, p.y) }); }
       function up(ev) {
         window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up);
-        // normalize the rect (works for all four drag directions) in CONTENT space, then STRICT
-        // CONTAINMENT per clip (Fix 4): a clip is selected only if its FULL rect — left, right,
-        // top, bottom — falls entirely inside the marquee. Partial overlap = not selected, so a
-        // drag no longer grabs background clips it merely brushes. Lane vertical bounds are
-        // measured cumulatively so open (variable-height) automation strips don't drift the test.
+        // normalize the rect (works for all four drag directions) in CONTENT space, then select by
+        // OVERLAP (standard DAW marquee): a clip is selected if its rect intersects the marquee at
+        // all on BOTH axes. Strict containment required the box to fully enclose a clip, which made
+        // selection impossible for the common case of stacked, multi-bar rack clips (wider than the
+        // drag) — a right-drag then selected nothing. Lane vertical bounds are measured cumulatively
+        // so open (variable-height) automation strips don't drift the test.
         var p = coords(ev);
         var x1 = x2t(Math.min(p0.x, p.x)), x2 = x2t(Math.max(p0.x, p.x));
         var y1 = Math.min(p0.y, p.y), y2 = Math.max(p0.y, p.y);
@@ -163,7 +164,7 @@
         var hit = []; clips.forEach(function (c) {
           var b = lb[c.ch]; if (!b) return;
           var clipLeft = c.startTick, clipRight = c.startTick + c.lengthTicks;
-          if (clipLeft >= x1 && clipRight <= x2 && b.top >= y1 && b.bottom <= y2) hit.push(c.id);
+          if (clipLeft < x2 && clipRight > x1 && b.top < y2 && b.bottom > y1) hit.push(c.id);
         });
         setSel(hit); setMq(null);
       }

@@ -18,6 +18,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   completion text was hardcoded to "44.1 kHz"; it now reflects the actual render
   rate (e.g. 48.0 kHz), matching the exported WAV. (`f164666`)
 
+- **Timeline marquee selection works again.** Right-drag (and the Marquee tool)
+  selects clips by **overlap** again instead of requiring the box to fully
+  enclose a clip. Strict containment made selection impossible for the common
+  case of stacked, multi-bar clips wider than the drag, so right-drag-to-select
+  (and copy/paste) grabbed nothing.
+
 ### Hardened
 - **Channel→insert routing is defensive against bad route ids.** Routing already
   resolves inserts strictly by id (robust to non-contiguous routes left by
