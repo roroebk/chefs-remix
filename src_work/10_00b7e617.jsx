@@ -12,58 +12,6 @@
     "beatContrast": 1
   }/*EDITMODE-END*/;
 
-  // ---------- demo project: NEON_GRID_V3_PROD ----------
-  function buildDemo() {
-    function S(ch, list) { list.forEach(function (a) { var st = E.banks[0].steps[ch][a[0]]; st.on = true; st.vel = a[1] == null ? 100 : a[1]; st.pitch = a[2] || 0; st.len = a[3] || 1; }); }
-    function S1(bank, ch, list) { list.forEach(function (a) { var st = E.banks[bank].steps[ch][a[0]]; st.on = true; st.vel = a[1] == null ? 100 : a[1]; st.pitch = a[2] || 0; st.len = a[3] || 1; }); }
-    // pattern 1 — main neon groove
-    S("kick", [[0, 122], [4, 118], [8, 122], [10, 60], [12, 118], [14, 70]]);
-    S("sub", [[0, 110, 0, 3], [3, 80, 0, 1], [6, 90, 3, 2], [8, 110, -2, 3], [11, 80, -2, 1], [14, 95, 5, 2]]);
-    S("snare", [[4, 118], [12, 120]]);
-    S("clap", [[4, 100], [12, 104], [7, 56], [15, 64]]);
-    S("chat", [[1, 70], [3, 96], [5, 70], [7, 100], [9, 70], [11, 96], [13, 72], [15, 104]]);
-    S("ohat", [[2, 80], [6, 86], [10, 80], [14, 90]]);
-    S("anvil", [[6, 92], [14, 100], [11, 50]]);
-    S("rim", [[3, 80], [7, 64], [11, 84], [13, 50]]);
-    S("vox", [[4, 110, 0, 2], [12, 108, 5, 2], [7, 70, 7, 1]]);
-    S("glitch", [[0, 100, 0, 1], [2, 70, 7, 1], [8, 100, -5, 1], [10, 76, 3, 1], [13, 64, 12, 1]]);
-    S("pluck", [[0, 96, 0, 3], [8, 96, 5, 3], [12, 80, 7, 2]]);
-    S("arp", [[0, 80, 0], [2, 72, 7], [4, 84, 12], [6, 72, 7], [8, 84, 0], [10, 72, 7], [12, 84, 15], [14, 72, 10]]);
-    S("shaker", [[0, 50], [2, 60], [4, 50], [6, 64], [8, 50], [10, 60], [12, 50], [14, 66], [1, 36], [5, 36], [9, 36], [13, 36]]);
-    // lead handled via piano-roll notes (empty steps)
-    var leadRiff = [[72, 0, 2, 110], [79, 2, 1, 96], [77, 3, 1, 90], [75, 4, 2, 104], [72, 6, 1, 84], [70, 8, 2, 100], [75, 10, 1, 88], [77, 11, 1, 92], [79, 12, 3, 112], [84, 15, 1, 80]];
-    leadRiff.forEach(function (n) { E.addNote("lead", n[0], n[1], n[2], n[3]); });
-
-    // pattern 2 — chorus (busier)
-    S1(1, "kick", [[0, 122], [3, 90], [6, 80], [8, 122], [11, 90], [14, 80]]);
-    S1(1, "snare", [[4, 118], [12, 120], [14, 70]]);
-    S1(1, "clap", [[4, 110], [12, 110]]);
-    S1(1, "chat", [[0, 70], [1, 90], [2, 70], [3, 96], [4, 70], [5, 90], [6, 70], [7, 100], [8, 70], [9, 90], [10, 70], [11, 96], [12, 70], [13, 90], [14, 70], [15, 104]]);
-    S1(1, "reese", [[0, 100, 0, 4], [8, 100, 3, 4]]);
-    S1(1, "pluck", [[0, 96, 0, 2], [4, 90, 5, 2], [8, 96, 7, 2], [12, 90, 3, 2]]);
-    S1(1, "vox", [[2, 90, 12, 1], [6, 80, 7, 1], [10, 90, 5, 1], [14, 80, 0, 1]]);
-    // pattern 3 — breakdown
-    S1(2, "kick", [[0, 120], [8, 110]]);
-    S1(2, "ohat", [[2, 80], [6, 80], [10, 80], [14, 80]]);
-    S1(2, "pluck", [[0, 90, 0, 4], [8, 90, -5, 4]]);
-    S1(2, "vox", [[0, 100, 0, 3], [10, 90, 7, 2]]);
-    S1(2, "riser", [[0, 90, 0, 16]]);
-
-    // arrangement
-    function fill(pat, lane, from, to) { for (var b = from; b < to; b++) E.addBlock(pat, b, lane); }
-    fill(0, 0, 0, 8); fill(1, 0, 8, 16); fill(0, 0, 16, 20); fill(1, 0, 20, 28); fill(2, 0, 28, 32);
-    fill(0, 1, 0, 16); fill(1, 1, 16, 28);
-    fill(0, 2, 4, 16); fill(1, 2, 16, 28);
-    fill(1, 3, 8, 16); fill(1, 3, 20, 28);
-    E.audioClips = [
-      { id: "v1", lane: 10, startBar: 8, lengthBars: 8, name: "Lead Vox", seed: 7 },
-      { id: "v2", lane: 10, startBar: 20, lengthBars: 8, name: "Chorus", seed: 13 },
-      { id: "a1", lane: 11, startBar: 9, lengthBars: 3, name: "Adlib", seed: 3 },
-      { id: "a2", lane: 11, startBar: 22, lengthBars: 4, name: "Adlib", seed: 17 }
-    ];
-    E.setLoop(0, 16);
-  }
-
   function useToasts() { var s = useState([]); function push(m, ic) { var id = Date.now() + Math.random(); s[1](function (x) { return x.concat([{ id: id, m: m, ic: ic }]); }); setTimeout(function () { s[1](function (x) { return x.filter(function (y) { return y.id !== id; }); }); }, 2600); } return [s[0], push]; }
 
   // ---------- FX editor modal ----------
@@ -627,16 +575,6 @@
     function loadSlot(nm2) { try { var raw = localStorage.getItem(SLOT_PREFIX + nm2); if (raw && E.hydrate(JSON.parse(raw))) { syncFromEngine(); bump(); toast("Loaded “" + nm2 + "”", h(I.Check, { width: 16, height: 16 })); } else toast("Slot unreadable", h(I.X, null)); } catch (e) { toast("Load failed", h(I.X, null)); } }
     function deleteSlot(nm2) { try { localStorage.removeItem(SLOT_PREFIX + nm2); var idx = JSON.parse(localStorage.getItem(SLOT_IDX) || "[]").filter(function (n) { return n !== nm2; }); localStorage.setItem(SLOT_IDX, JSON.stringify(idx)); setSlots(idx); } catch (e) {} }
 
-    function loadDemo() {
-      E.loadDemoChannels();                                   // register the catalog channels
-      E.blocks = []; E.banks.forEach(function (bk) { bk.notes = []; }); // clear arrangement/notes so re-loads don't stack
-      buildDemo();                                            // fill the actual NEON_GRID groove (steps + notes + blocks)
-      E.syncAllRackClips();                                   // timeline-first: mirror the groove onto timeline lanes now
-      E.setActivePattern(0); setActive(0); setView("timeline");
-      setFocus(E.focus); E.setFocus(E.focus); setBpm(E.tempo); setSwing(E.swing); bump();
-      toast("NEON_GRID demo loaded", h(I.Sparkle, { width: 16, height: 16 }));
-    }
-
     // derived state
     var channelState = {}; E.channelDefs.forEach(function (c) { var ch = E.channels[c.id]; channelState[c.id] = { route: ch.route, vol: ch.vol, pan: ch.pan, muted: ch.muted, solo: ch.solo }; });
     var litMap = {}; if (playing && playStep >= 0 && mode === "pattern") { E.channelDefs.forEach(function (c) { litMap[c.id] = E.banks[active].steps[c.id][playStep].on; }); }
@@ -655,7 +593,6 @@
       { id: "redo", label: "Redo", hint: "Ctrl+Y", run: doRedo },
       { id: "add", label: "Add Track", run: function () { addTrack("kick"); } },
       { id: "add-synth", label: "Add Synth Track (Polyphonic)", run: addSynth },
-      { id: "demo", label: "Load Demo Project", run: loadDemo },
       { id: "new", label: "New Clean Project", run: newProject },
       { id: "export", label: "Export… (Mixdown / Stems)", run: function () { setShowEx(true); } },
       { id: "save", label: "Export Project (.json)", run: exportProject },
@@ -692,7 +629,6 @@
             h("div", { className: "tabs" },
               TABS.map(function (tb) { return h("button", { key: tb.id, className: "tab" + (view === tb.id ? " on" : ""), onClick: function () { setView(tb.id); setEditClip(null); } }, h("span", { className: "ti" }, h(tb.ic, { width: 16, height: 16 })), tb.label); }),
               h("button", { className: "hdr-btn", title: "Add a native polyphonic Synth track — then double-click its timeline lane to draw notes in the Piano Roll", onClick: addSynth }, [h(I.Piano, { width: 14, height: 14, key: "i" }), " Synth"]),
-              h("button", { className: "hdr-btn", title: "Load the NEON_GRID demo project", onClick: loadDemo }, "Load Demo"),
               h(ProjectMenu, { onNew: newProject, onExport: exportProject, onImportFile: importProjectFile, onSaveSlot: saveSlot, onLoadSlot: loadSlot, onDeleteSlot: deleteSlot, slots: slots, onOpen: refreshSlots }),
               h("button", { className: "hdr-btn", title: "Undo (Ctrl+Z)", onClick: doUndo }, "↶"),
               h("button", { className: "hdr-btn", title: "Redo (Ctrl+Y)", onClick: doRedo }, "↷"),
@@ -714,9 +650,9 @@
                     h(AddTrackBar, { onAdd: addTrack }))
                   : view === "piano" ? (
                       editingClip
-                        ? h(window.PianoRoll, { ch: (E.channels[editingClip.ch] && E.channels[editingClip.ch].def) || prCh, pattern: clipToPattern(editingClip), steps: Math.max(16, Math.ceil(editingClip.lengthTicks / TPS / 16) * 16), playStep: -1, rev: rev, onAddNote: clipAddNote(editingClip), onUpdateNote: clipUpdNote(editingClip), onRemoveNote: clipRemNote(editingClip), commit: bump })
+                        ? h(window.PianoRoll, { ch: (E.channels[editingClip.ch] && E.channels[editingClip.ch].def) || prCh, pattern: clipToPattern(editingClip), steps: Math.max(16, Math.ceil(editingClip.lengthTicks / TPS / 16) * 16), playStep: -1, rev: rev, onAddNote: clipAddNote(editingClip), onUpdateNote: clipUpdNote(editingClip), onRemoveNote: clipRemNote(editingClip), onPreview: function (p) { var d = E.channels[editingClip.ch] && E.channels[editingClip.ch].def; if (d && d.tonal) E.previewNote(editingClip.ch, p - (d.base || 0), 100); }, commit: bump })
                         : prCh
-                          ? h(window.PianoRoll, { ch: prCh, pattern: E.banks[active], steps: E.getPatternLength(active) * 16, lengthBars: E.getPatternLength(active), onSetLength: function (b) { E.setPatternLength(b, active); bump(); }, playStep: mode === "pattern" ? playStep : -1, rev: rev, onAddNote: function (c, p, s, l) { return E.addNote(c, p, s, l); }, onUpdateNote: function (id, patch) { E.updateNote(id, patch); }, onRemoveNote: function (id) { E.removeNote(id); }, commit: bump })
+                          ? h(window.PianoRoll, { ch: prCh, pattern: E.banks[active], steps: E.getPatternLength(active) * 16, lengthBars: E.getPatternLength(active), onSetLength: function (b) { E.setPatternLength(b, active); bump(); }, playStep: mode === "pattern" ? playStep : -1, rev: rev, onAddNote: function (c, p, s, l) { return E.addNote(c, p, s, l); }, onUpdateNote: function (id, patch) { E.updateNote(id, patch); }, onRemoveNote: function (id) { E.removeNote(id); }, onPreview: function (p) { if (prCh && prCh.tonal) E.previewNote(prCh.id, p - (prCh.base || 0), 100); }, commit: bump })
                           : h(EmptyPane, { title: "No tonal instrument", sub: "Add a melodic track (it routes here automatically)." }))
                     : h(window.Timeline, { channels: E.channelDefs, playheadTick: playTick, tool: toolMode, onSetTool: setToolMode, onCommit: bump, onDeleteTrack: deleteTrack, onFocusStrip: doFocus, onScrub: function (tick) { E.seek(tick); setPlayTick(tick); }, onOpenClip: function (clip) { doFocus(clip.ch); setView("piano"); setEditClip(clip); }, onOpenClipFx: openClipFx, onEditClip: function (clip) { doFocus(clip.ch); setClipEdit(clip); }, onOpenWave: function (clip) { doFocus(clip.ch); setWaveClip(clip); }, onToast: function (m) { toast(m, h(I.Mic, { width: 16, height: 16 })); } })),
               h("div", { className: "dashboard" },

@@ -33,6 +33,7 @@
       if (e.button === 2) return; e.preventDefault();
       var start = snapV(xToStep(e.clientX)); var pitch = yToPitch(e.clientY); var len = snapStep();
       var id = props.onAddNote(ch.id, pitch, start, len);
+      props.onPreview && props.onPreview(pitch);   // audition the placed note (reserved preview pool)
       function mv(ev) { var l = snapV(xToStep(ev.clientX) - start); props.onUpdateNote(id, { len: Math.max(snapStep(), l || snapStep()) }); }
       function up() { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); props.commit(); }
       window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
@@ -41,9 +42,15 @@
       e.preventDefault(); e.stopPropagation(); if (e.button === 2) { props.onRemoveNote(n.id); props.commit(); return; }
       var resize = e.target.classList.contains("rs");
       var sx = xToStep(e.clientX), origStart = n.start, origLen = n.len, origPitch = n.pitch, sy = e.clientY;
+      var lastPrev = origPitch;   // debounce preview to one audition per semitone crossed (not per mousemove)
       function mv(ev) {
         if (resize) { var nl = origLen + (xToStep(ev.clientX) - sx); props.onUpdateNote(n.id, { len: Math.max(snapStep(), snapV(nl)) }); }
-        else { var ns = snapV(origStart + (xToStep(ev.clientX) - sx)); var dp = Math.round((sy - ev.clientY) / LANE); props.onUpdateNote(n.id, { start: ns, pitch: Math.max(lo, Math.min(hi, origPitch + dp)) }); }
+        else {
+          var ns = snapV(origStart + (xToStep(ev.clientX) - sx)); var dp = Math.round((sy - ev.clientY) / LANE);
+          var np = Math.max(lo, Math.min(hi, origPitch + dp));
+          props.onUpdateNote(n.id, { start: ns, pitch: np });
+          if (np !== lastPrev) { lastPrev = np; props.onPreview && props.onPreview(np); }   // preview only on pitch change
+        }
       }
       function up() { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); props.commit(); }
       window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);

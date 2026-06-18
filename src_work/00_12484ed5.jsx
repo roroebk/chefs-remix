@@ -122,7 +122,10 @@
     // ---- linear timeline model (Phase 1, additive/dormant for now) ----
     // single continuous arrangement: absolute-tick clips on shared lanes. PPQ-based so snapping
     // is exact and clips stay movable/copyable as units (notes are stored relative to clip start).
-    this.timeline = { lengthTicks: 32 * TICKS_PER_BAR, loop: { startTick: 0, endTick: 16 * TICKS_PER_BAR, on: true }, clips: [], automation: {} };
+    // Synth Suite (this batch): loop defaults OFF so a fresh arrangement plays past Measure 17
+    // (bar 16) without wrapping/cutting — playback scales dynamically to lengthTicks. The wrap
+    // mechanism in _scheduleTimeline still honors loop.on when a session explicitly sets it.
+    this.timeline = { lengthTicks: 32 * TICKS_PER_BAR, loop: { startTick: 0, endTick: 16 * TICKS_PER_BAR, on: false }, clips: [], automation: {} };
     this._clipSeq = 0;
     this.PPQ = PPQ; this.TICKS_PER_BAR = TICKS_PER_BAR; this.TICKS_PER_STEP = TICKS_PER_STEP; this.SNAP_TICKS = SNAP_TICKS;
     this.onStep = null; this.onMeter = null; this._lastStep = -1; this.meterFps = 60; this._meterLast = 0;
@@ -135,6 +138,11 @@
     // Live OscillatorNode voices for kind:'synth' tracks, tracked so pause/stop can de-click them
     // and so the polyphony cap (_synthPoly) can steal the oldest voice on dense patterns.
     this._synthVoices = []; this._synthPoly = 16;
+    // Reserved PREVIEW voice sub-pool (Synth Suite, this batch): Piano-Roll auditions route here
+    // through a distinct gain bus (_synthPrevBus -> master) and a separate small FIFO pool, NEVER
+    // through _synthVoices/_stealSynth — so an audible preview while editing can never steal a
+    // sustaining playback voice. Phase 2 (previewNote) consumes this.
+    this._prevVoices = []; this._prevPoly = 4; this._synthPrevBus = null;
     // Phase 4: last sounded (tick,time) schedule point — the playhead UI interpolates off the
     // audio clock from here for sample-accurate 1:1 motion (not the 1/16 step grid).
     this._phPoint = null;
@@ -376,9 +384,11 @@
   // id-based mixer channel as every other voice (out = ch.gain -> panner -> inserts[route]).
   // ctx is passed in (live this.ctx OR an OfflineAudioContext for export); live voices are tracked
   // for the polyphony cap + de-click on stop. midi = absolute MIDI note (A4 = 440Hz, equal temp).
-  Engine.prototype._synthVoice = function (ctx, t, out, midi, vel, durSec, params) {
+  Engine.prototype._synthVoice = function (ctx, t, out, midi, vel, durSec, params, opts) {
     if (!out) return null;
     params = params || {};
+    opts = opts || {};
+    var preview = !!opts.preview;   // preview voices use the reserved sub-pool, not _synthVoices
     var wave = params.wave || "sawtooth";
     // ADSR (seconds / 0..1). attack ~5ms is click-free; release reuses the >=8ms de-click floor so
     // a synth note-off ramps to silence on the same contract as the 808 sampler voices.
@@ -390,8 +400,9 @@
     var hold = (durSec && durSec > 0) ? durSec : 0.25;
     var peak = Math.max(0.0008, v * 0.45);            // headroom: many voices may stack
     var sus = Math.max(0.0006, peak * S);
-    // live polyphony cap with voice-stealing (skip for the offline bounce — no realtime CPU bound)
-    if (ctx === this.ctx) this._stealSynth();
+    // live polyphony cap with voice-stealing (skip for the offline bounce — no realtime CPU bound).
+    // preview auditions cap their OWN reserved pool so they never steal a sustaining playback voice.
+    if (ctx === this.ctx) { if (preview) this._stealPrev(); else this._stealSynth(); }
     var osc = ctx.createOscillator(); osc.type = wave; osc.frequency.setValueAtTime(m2f(midi), t);
     var g = ctx.createGain();
     var t0 = t, atkEnd = t0 + A, decEnd = atkEnd + D;
@@ -407,9 +418,10 @@
     osc.connect(g); g.connect(out);
     osc.start(t0); try { osc.stop(relEnd + 0.02); } catch (e) {}
     if (ctx === this.ctx) {
-      var self = this, voice = { osc: osc, gain: g, end: relEnd };
-      this._synthVoices.push(voice);
-      osc.onended = function () { var k = self._synthVoices.indexOf(voice); if (k >= 0) self._synthVoices.splice(k, 1); };
+      var voice = { osc: osc, gain: g, end: relEnd };
+      var pool = preview ? this._prevVoices : this._synthVoices;
+      pool.push(voice);
+      osc.onended = function () { var k = pool.indexOf(voice); if (k >= 0) pool.splice(k, 1); };
     }
     return g;
   };
@@ -419,6 +431,19 @@
     var cap = this._synthPoly || 16, ctx = this.ctx;
     while (this._synthVoices.length >= cap) {
       var old = this._synthVoices.shift(); if (!old) break;
+      try {
+        var now = ctx.currentTime, gg = old.gain.gain, cur = gg.value; if (!(cur > 0.0001)) cur = 0.0001;
+        gg.cancelScheduledValues(now); gg.setValueAtTime(cur, now); gg.exponentialRampToValueAtTime(0.0001, now + 0.008);
+        old.osc.onended = null; old.osc.stop(now + 0.02);
+      } catch (e) {}
+    }
+  };
+  // preview-pool voice-stealing: identical FIFO de-click as _stealSynth but bounded by _prevPoly
+  // and operating ONLY on _prevVoices, so previewing never touches a playback voice.
+  Engine.prototype._stealPrev = function () {
+    var cap = this._prevPoly || 4, ctx = this.ctx;
+    while (this._prevVoices.length >= cap) {
+      var old = this._prevVoices.shift(); if (!old) break;
       try {
         var now = ctx.currentTime, gg = old.gain.gain, cur = gg.value; if (!(cur > 0.0001)) cur = 0.0001;
         gg.cancelScheduledValues(now); gg.setValueAtTime(cur, now); gg.exponentialRampToValueAtTime(0.0001, now + 0.008);
@@ -690,6 +715,25 @@
   Engine.prototype.playLiveNote = function (chId, semis, vel) {
     this.init(); this.resume(); var ch = this.channels[chId]; if (!ch) return;
     this._fire(chId, this.ctx.currentTime, semis, vel || 100, ch.def.tonal ? 0.5 : 0.2);
+  };
+  // lazily-built reserved preview bus: a dedicated gain -> master (NOT a channel insert), so
+  // preview auditions are isolated at the graph level from the arrangement mix.
+  Engine.prototype._prevBus = function () {
+    this.init();
+    if (!this._synthPrevBus) { var g = this.ctx.createGain(); g.gain.value = 0.9; g.connect(this.master); this._synthPrevBus = g; }
+    return this._synthPrevBus;
+  };
+  // audition a single note through the RESERVED preview sub-pool (Synth Suite Phase 2). semis =
+  // offset from the channel root, matching _fire. Short (0.2s) so rapid edits don't pile up. A
+  // synth track routes its preview through the reserved pool/bus (cannot steal playback voices);
+  // any other tonal track falls back to the normal short audition.
+  Engine.prototype.previewNote = function (chId, semis, vel) {
+    this.init(); this.resume(); var ch = this.channels[chId]; if (!ch) return;
+    if (ch.def.kind === "synth") {
+      this._synthVoice(this.ctx, this.ctx.currentTime, this._prevBus(), (ch.def.base || 0) + (semis || 0), vel || 100, 0.2, ch.def.synth, { preview: true });
+      return;
+    }
+    this.playLiveNote(chId, semis, vel || 100);
   };
   Engine.prototype.armPerf = function (on) { this._perfArmed = !!on; };
   Engine.prototype.isPerfArmed = function () { return !!this._perfArmed; };
@@ -1586,7 +1630,7 @@
   // (no live nodes), so it is safe to run before the rest of hydrate().
   Engine.prototype._migrateV3toV4 = function (data) {
     var TPB = TICKS_PER_BAR, TPS = TICKS_PER_STEP;
-    data.timeline = data.timeline || { clips: [], loop: { startTick: 0, endTick: 16 * TPB, on: true }, lengthTicks: 32 * TPB, automation: {} };
+    data.timeline = data.timeline || { clips: [], loop: { startTick: 0, endTick: 16 * TPB, on: false }, lengthTicks: 32 * TPB, automation: {} };
     // drop transient rack-mirror clips — bank content is re-materialized as permanent clips below
     var clips = (data.timeline.clips || []).filter(function (c) { return !c._rack; });
     var chDefs = data.channels || [], seq = 0;

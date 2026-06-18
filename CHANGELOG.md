@@ -40,6 +40,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stale schedule points so scrub + the existing screen-recording stream stay
   locked to the same playhead offset / zoom ratio.
 
+### Added — Synth Suite master-prompt deltas
+- **Reserved preview voice sub-pool.** Piano-Roll auditions now route through a
+  dedicated preview bus (`_synthPrevBus` → master) and a separate small FIFO pool
+  (`_prevVoices`, cap `_prevPoly = 4`, stolen by `_stealPrev`), never through
+  `_synthVoices` / `_stealSynth` — so previewing a note while editing can **never
+  steal a sustaining playback voice**. New `previewNote(chId,semis,vel)` fires a
+  synth audition through the reserved pool (`_synthVoice(…,{preview:true})`); other
+  tonal tracks fall back to the standard short audition.
+- **Auditory preview in the Piano Roll.** Placing a note and dragging a note's
+  pitch now fire an instant preview via the reserved pool, **debounced to one
+  preview per semitone crossed** (not per mouse-move; the resize edge never
+  previews). Wired only for tonal channels via the `onPreview` prop.
+- **Measure-17 transport fix → infinite default.** Timeline `loop.on` now defaults
+  **off** (constructor + hydrate fallback), so a fresh arrangement plays past bar 16
+  / Measure 17 without wrapping — playback scales to `lengthTicks`. The loop-wrap
+  mechanism is intact and still honored whenever a session sets `loop.on`.
+- **Removed `[Load Demo]`.** The master-toolbar button, the command-palette entry,
+  and the `loadDemo` / `buildDemo` handlers are gone (no orphaned listeners); the
+  empty-timeline hint no longer references it. Engine `loadDemoChannels` is left
+  intact (harmless, unreferenced).
+
 ### Changed — FINAL BUILD: linear-timeline refactor (schema 4)
 - **Schema 3 → 4 migration.** `hydrate` now auto-migrates saved schema-3
   projects (banks / loop / activePattern) into the pure linear-clip model:

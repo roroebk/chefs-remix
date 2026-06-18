@@ -458,7 +458,7 @@
                 (recClip && recClip.ch === lane.id) ? recordingClipEl(recClip) : null,
                 playX >= 0 ? h("div", { className: "tl-playhead", style: { left: playX } }) : null));
             return h(React.Fragment, { key: lane.id }, row, autoStripEl(lane));
-          }) : h("div", { className: "tl-empty" }, "No lanes yet — add a track, “Load Demo”, or hit Rec Audio to record a take."),
+          }) : h("div", { className: "tl-empty" }, "No lanes yet — add a track, hit ▸ Synth to draw a melody, or Rec Audio to record a take."),
           mq ? h("div", { className: "tl-marquee", style: { left: TL_HEAD + mq.x0, top: TL_RULER + mq.y0, width: mq.x1 - mq.x0, height: mq.y1 - mq.y0 } }) : null,
           recPhase === "countin" ? h("div", { className: "tl-countin" }, h("div", { className: "tl-countin-ring", key: countBeat }), h("div", { className: "tl-countin-num" }, "COUNT-IN " + Math.min(4, countBeat + 1) + " / 4")) : null)));
   }
