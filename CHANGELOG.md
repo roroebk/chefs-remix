@@ -5,6 +5,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Synth & Melody Creation Suite (4 phases)
+- **Phase 1 — native polyphonic synth.** New track type `track.kind = 'synth'`
+  alongside `'sampler'` / `'audioLane'`. `_synthVoice(ctx,…)` generates Saw /
+  Triangle / Square `OscillatorNode` voices (A4 = 440Hz equal temperament) with a
+  strict per-voice **ADSR** gain envelope (attack ~5ms click-free; release reuses
+  the ≥8ms de-click floor so note-offs match the 808 contract — no voice is ever
+  hard-stopped at non-zero gain). 16-voice **polyphony cap with voice-stealing**
+  (`_stealSynth` de-clicks + drops the oldest voice). `_fire` and `renderMixdown`
+  both branch on `kind:'synth'`; `pause`/`stop` de-click-kill live synth voices
+  (`_killSynthVoices`). `addSynthTrack(name,wave)` appends a tonal synth lane on
+  its own id-based insert; `synth` params + `kind` round-trip serialize/hydrate
+  (still schema 4, additive). Entry points: header **▸ Synth** button, command
+  palette, and the AddTrackBar picker.
+- **Phase 2 — Piano Roll on empty-lane double-click.** Locked double-click
+  disambiguation (branch on clip presence): double-clicking an **empty** melody
+  lane creates a 1-bar MIDI clip there and opens the Piano Roll on it; an audio
+  lane's empty area is a no-op; double-clicking an **active audio clip** opens the
+  Waveform Editor (unchanged) — neither binding clobbers the other. Notes persist
+  to the clip (absolute ticks) and the timeline scheduler fires the Phase-1 synth
+  attacks in sync.
+- **Phase 3 — Factory asset purge (listing only).** The stock "Factory Core"
+  demo entries (Drums / 808s / Synths / Kicks / Snares / Hi-Hats / …) are hidden
+  from the sidebar library listing **and** search, so new projects start blank /
+  custom-ready. The factory **metadata tree stays fully intact** in
+  `window.__FACTORY` (nothing deleted), and saved projects resolve their voices
+  via their own channel `type`, so a project referencing factory samples still
+  loads + plays. Only user-linked folders (`userRoot`) are surfaced.
+- **Phase 4 — Playhead ↔ visualizer sample-offset sync.** `_draw` now drives the
+  timeline playhead directly off the transport's audio-clock sample offset
+  (`tick = point.tick + (now − point.time)/secPerTick`, capped one step ahead),
+  giving smooth, sample-accurate 1:1 motion instead of the 1/16 step grid. `start`
+  seeds the playhead anchor; `seek` (manual scrub / drag) re-anchors and drops
+  stale schedule points so scrub + the existing screen-recording stream stay
+  locked to the same playhead offset / zoom ratio.
+
 ### Changed — FINAL BUILD: linear-timeline refactor (schema 4)
 - **Schema 3 → 4 migration.** `hydrate` now auto-migrates saved schema-3
   projects (banks / loop / activePattern) into the pure linear-clip model:

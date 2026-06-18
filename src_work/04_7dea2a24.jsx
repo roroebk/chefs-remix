@@ -27,6 +27,15 @@
     ], "#39ff14");
   }
   function getFactory() { return window.__FACTORY || (window.__FACTORY = factoryTree()); }
+  // ---- Phase 3: Factory Asset Purge (LISTING ONLY) ----
+  // New projects start with an empty, custom-ready library. We HIDE the stock "Factory Core" demo
+  // entries (Drums / 808s / Synths / Kicks / Snares / Hi-Hats / …) from the sidebar listing + search
+  // — but the factory metadata tree itself stays fully intact in window.__FACTORY (factoryTree is
+  // still built and seeded). Nothing here deletes assets or breaks the type/base/sampleId metadata
+  // that saved projects resolve their channel voices against (channels carry their own type, so a
+  // saved project loads + plays regardless of what the browser lists). Only USER-linked folders
+  // (userRoot) are surfaced as the visible library.
+  function visibleRoots() { return getFactory().children.filter(function (n) { return n.userRoot; }); }
 
   // ---- generate a deep nested kit for a simulated (no real handle) folder link ----
   function genKit(alias) {
@@ -227,7 +236,8 @@
     var q = query.trim().toLowerCase();
     var body;
     if (q) {
-      var all = []; flatten(factory, "", all);
+      // Phase 3: search only the visible (user-linked) library; stock factory entries stay hidden.
+      var all = []; visibleRoots().forEach(function (r) { flatten(r, "", all); });
       var hits = all.filter(function (x) { return fuzzy(x.s.name, q) || fuzzy(x.path.toLowerCase(), q); });
       body = h("div", { className: "brws" },
         h("div", { className: "tree-sec" }, hits.length + " RESULT" + (hits.length === 1 ? "" : "S")),
@@ -245,7 +255,14 @@
         h("input", { type: "file", ref: melodyRef, accept: "audio/*,video/*", multiple: true, style: { display: "none" }, onChange: function (e) { addMelodies(e.target.files); e.target.value = ""; } }),
         h("div", { className: "tree" },
           h("div", { className: "tree-sec" }, "LIBRARY"),
-          renderNode(factory, 0, false)));
+          // Phase 3: render only user-linked folders — the stock Factory Core listing is purged so
+          // new projects start blank/custom-ready (the factory metadata still lives in __FACTORY).
+          (function () {
+            var roots = visibleRoots();
+            if (!roots.length) return h("div", { className: "tree-empty" }, "Library is empty — “Link Instrumental Folder” to mount your own samples, or “Add Melody File” to drop audio onto the timeline.");
+            var rows = []; roots.forEach(function (r) { rows = rows.concat(renderNode(r, 0, false)); });
+            return rows;
+          })()));
     } else if (tab === "inst") {
       body = h("div", { className: "brws" }, h("div", { className: "brws-grp" }, h("h5", null, "Instruments · " + props.channelDefs.length),
         props.channelDefs.map(function (c) { return h("div", { key: c.id, className: "brws-item" + (props.focus === c.id ? " sel" : ""), onClick: function () { props.onFocus(c.id); window.engine.trigger(c.id, 0); } }, h("span", { className: "ico", style: { color: c.color } }, h(I.Disc, { width: 15, height: 15 })), h("span", { className: "nm" }, c.label), h("span", { className: "tag" }, "M" + ("0" + c.route).slice(-2))); })));

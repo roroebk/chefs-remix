@@ -217,7 +217,7 @@
       { type: "kick", label: "Kick (Perc)" }, { type: "snare", label: "Snare (Perc)" },
       { type: "chat", label: "Hat (Perc)" }, { type: "sub", label: "Sub Bass (Mel)" },
       { type: "pluck", label: "Chord Pluck (Mel)" }, { type: "lead", label: "Lead (Mel)" },
-      { type: "vox", label: "Vocal (Mel)" }
+      { type: "vox", label: "Vocal (Mel)" }, { type: "synth", label: "Synth — Polyphonic (Mel)" }
     ];
     var open = useState(false); var isOpen = open[0], setOpen = open[1];
     return h("div", { className: "addtrack-bar" },
@@ -596,7 +596,10 @@
     }
 
     // dynamic lane add / delete (delete purges step+note data and disconnects audio nodes in the engine)
-    function addTrack(type) { var d = E.addChannel(type); setFocus(E.focus); E.setFocus(E.focus); if (d.tonal) lastTonal.current = d.id; bump(); toast("Added " + d.label, h(I.Plus, { width: 16, height: 16 })); }
+    function addTrack(type) { var d = (type === "synth") ? E.addSynthTrack() : E.addChannel(type); setFocus(E.focus); E.setFocus(E.focus); if (d.tonal) lastTonal.current = d.id; bump(); toast("Added " + d.label, h(I.Plus, { width: 16, height: 16 })); }
+    // Synth Suite (Phase 1/2): append a native polyphonic synth track and land on the Timeline so
+    // the user can immediately double-click its empty lane to open the Piano Roll and draw notes.
+    function addSynth() { setView("timeline"); var d = E.addSynthTrack(); setFocus(E.focus); E.setFocus(E.focus); lastTonal.current = d.id; bump(); toast("Added " + d.label + " — double-click its lane to draw notes", h(I.Piano, { width: 16, height: 16 })); }
     function deleteTrack(id) { var ch = E.channels[id]; var label = ch ? ch.def.label : "Track"; E.removeChannel(id); if (lastTonal.current === id) lastTonal.current = null; setFocus(E.focus); E.setFocus(E.focus); bump(); toast(label + " removed", h(I.Trash, { width: 16, height: 16 })); }
     // ---- project controls (Phase 1: New / Slots / Export-Import) ----
     var SLOT_IDX = "chefs_project_slots", SLOT_PREFIX = "chefs_slot:";
@@ -651,6 +654,7 @@
       { id: "undo", label: "Undo", hint: "Ctrl+Z", run: doUndo },
       { id: "redo", label: "Redo", hint: "Ctrl+Y", run: doRedo },
       { id: "add", label: "Add Track", run: function () { addTrack("kick"); } },
+      { id: "add-synth", label: "Add Synth Track (Polyphonic)", run: addSynth },
       { id: "demo", label: "Load Demo Project", run: loadDemo },
       { id: "new", label: "New Clean Project", run: newProject },
       { id: "export", label: "Export… (Mixdown / Stems)", run: function () { setShowEx(true); } },
@@ -687,6 +691,7 @@
           h("div", { className: "stage-main" },
             h("div", { className: "tabs" },
               TABS.map(function (tb) { return h("button", { key: tb.id, className: "tab" + (view === tb.id ? " on" : ""), onClick: function () { setView(tb.id); setEditClip(null); } }, h("span", { className: "ti" }, h(tb.ic, { width: 16, height: 16 })), tb.label); }),
+              h("button", { className: "hdr-btn", title: "Add a native polyphonic Synth track — then double-click its timeline lane to draw notes in the Piano Roll", onClick: addSynth }, [h(I.Piano, { width: 14, height: 14, key: "i" }), " Synth"]),
               h("button", { className: "hdr-btn", title: "Load the NEON_GRID demo project", onClick: loadDemo }, "Load Demo"),
               h(ProjectMenu, { onNew: newProject, onExport: exportProject, onImportFile: importProjectFile, onSaveSlot: saveSlot, onLoadSlot: loadSlot, onDeleteSlot: deleteSlot, slots: slots, onOpen: refreshSlots }),
               h("button", { className: "hdr-btn", title: "Undo (Ctrl+Z)", onClick: doUndo }, "↶"),

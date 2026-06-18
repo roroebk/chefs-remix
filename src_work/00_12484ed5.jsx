@@ -131,6 +131,13 @@
     // The transport doesn't otherwise track them, so pause/stop would leave long melody lanes
     // ringing. Held here so pause/stop can de-click-ramp + stop them synchronously.
     this._laneVoices = [];
+    // ---- Synth Suite (Phase 1): native polyphonic oscillator synth ----
+    // Live OscillatorNode voices for kind:'synth' tracks, tracked so pause/stop can de-click them
+    // and so the polyphony cap (_synthPoly) can steal the oldest voice on dense patterns.
+    this._synthVoices = []; this._synthPoly = 16;
+    // Phase 4: last sounded (tick,time) schedule point — the playhead UI interpolates off the
+    // audio clock from here for sample-accurate 1:1 motion (not the 1/16 step grid).
+    this._phPoint = null;
   }
 
   // ---- audio graph ----------------------------------------------------------
@@ -363,6 +370,75 @@
       } catch (e) {}
     }
   };
+  // ---- Synth Suite (Phase 1): native polyphonic oscillator synth -----------
+  // A real-time synthesis source for kind:'synth' tracks. One OscillatorNode per note (Saw /
+  // Triangle / Square), shaped by a strict per-voice ADSR gain envelope, routed into the same
+  // id-based mixer channel as every other voice (out = ch.gain -> panner -> inserts[route]).
+  // ctx is passed in (live this.ctx OR an OfflineAudioContext for export); live voices are tracked
+  // for the polyphony cap + de-click on stop. midi = absolute MIDI note (A4 = 440Hz, equal temp).
+  Engine.prototype._synthVoice = function (ctx, t, out, midi, vel, durSec, params) {
+    if (!out) return null;
+    params = params || {};
+    var wave = params.wave || "sawtooth";
+    // ADSR (seconds / 0..1). attack ~5ms is click-free; release reuses the >=8ms de-click floor so
+    // a synth note-off ramps to silence on the same contract as the 808 sampler voices.
+    var A = Math.max(0.001, params.attack != null ? params.attack : 0.005);
+    var D = Math.max(0.001, params.decay != null ? params.decay : 0.12);
+    var S = Math.min(1, Math.max(0.0001, params.sustain != null ? params.sustain : 0.7));
+    var R = Math.max(0.008, params.release != null ? params.release : 0.08);   // de-click floor
+    var v = (vel == null ? 100 : vel) / 127;
+    var hold = (durSec && durSec > 0) ? durSec : 0.25;
+    var peak = Math.max(0.0008, v * 0.45);            // headroom: many voices may stack
+    var sus = Math.max(0.0006, peak * S);
+    // live polyphony cap with voice-stealing (skip for the offline bounce — no realtime CPU bound)
+    if (ctx === this.ctx) this._stealSynth();
+    var osc = ctx.createOscillator(); osc.type = wave; osc.frequency.setValueAtTime(m2f(midi), t);
+    var g = ctx.createGain();
+    var t0 = t, atkEnd = t0 + A, decEnd = atkEnd + D;
+    var relStart = Math.max(t0 + hold, decEnd);       // ensure the decay segment always completes
+    var relEnd = relStart + R;
+    // ADSR: never hard-step; exponential ramps stay > 0 (WebAudio requirement) and end on a
+    // de-click ramp so the voice is never cut at non-zero gain.
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, atkEnd);          // Attack
+    g.gain.exponentialRampToValueAtTime(sus, decEnd);           // Decay -> Sustain level
+    g.gain.setValueAtTime(sus, relStart);                       // Sustain hold
+    g.gain.exponentialRampToValueAtTime(0.0001, relEnd);        // Release (>= de-click)
+    osc.connect(g); g.connect(out);
+    osc.start(t0); try { osc.stop(relEnd + 0.02); } catch (e) {}
+    if (ctx === this.ctx) {
+      var self = this, voice = { osc: osc, gain: g, end: relEnd };
+      this._synthVoices.push(voice);
+      osc.onended = function () { var k = self._synthVoices.indexOf(voice); if (k >= 0) self._synthVoices.splice(k, 1); };
+    }
+    return g;
+  };
+  // voice-stealing: while at/over the polyphony cap, de-click-ramp + stop the OLDEST live voice
+  // (front of the queue) so dense patterns can't spawn unbounded oscillators / spike CPU.
+  Engine.prototype._stealSynth = function () {
+    var cap = this._synthPoly || 16, ctx = this.ctx;
+    while (this._synthVoices.length >= cap) {
+      var old = this._synthVoices.shift(); if (!old) break;
+      try {
+        var now = ctx.currentTime, gg = old.gain.gain, cur = gg.value; if (!(cur > 0.0001)) cur = 0.0001;
+        gg.cancelScheduledValues(now); gg.setValueAtTime(cur, now); gg.exponentialRampToValueAtTime(0.0001, now + 0.008);
+        old.osc.onended = null; old.osc.stop(now + 0.02);
+      } catch (e) {}
+    }
+  };
+  // de-click + stop every live synth voice on transport pause/stop (mirrors _killLaneVoices).
+  Engine.prototype._killSynthVoices = function () {
+    var ctx = this.ctx; var vs = this._synthVoices; this._synthVoices = [];
+    if (!ctx) return;
+    var now = ctx.currentTime, R = 0.008;
+    for (var i = 0; i < vs.length; i++) {
+      try {
+        var gg = vs[i].gain.gain, cur = gg.value; if (!(cur > 0.0001)) cur = 0.0001;
+        gg.cancelScheduledValues(now); gg.setValueAtTime(cur, now); gg.exponentialRampToValueAtTime(0.0001, now + R);
+        vs[i].osc.onended = null; vs[i].osc.stop(now + R + 0.01);
+      } catch (e) {}
+    }
+  };
   // Per-step modulation node (Fix 2): wrap the voice destination with an optional gain (dB
   // offset) + stereo pan so a single step can be louder/quieter and panned without touching the
   // channel's own level/pan. Returns the node the voice should connect INTO. No-op when 0/0.
@@ -387,6 +463,9 @@
     // note/step length so it stops at its boundary instead of ringing on at full buffer length
     // and stacking under the next trigger (the "intense echo / slap-back" bug). Non-tonal
     // one-shots (drums) pass 0 -> full natural decay, unchanged.
+    // SCHED: kind:'synth' tracks fire the native polyphonic oscillator synth (Phase 1) instead of
+    // a sampler buffer or a fixed factory voice. midi = channel root (base) + the note's semis.
+    if (ch.def.kind === "synth") { this._synthVoice(this.ctx, t, dest, (ch.def.base || 0) + (semis || 0), vel, durSec, ch.def.synth); return; }
     if (ch.def.type === "sampler") { this._playBuffer(this.ctx, this.userBuffers[ch.def.bufferId], t, dest, semis, vel, ch.def.tonal ? durSec : 0); return; }
     this._voice(this.ctx, this.noise, ch.def.type, t, dest, semis, vel, durSec);
   };
@@ -666,6 +745,7 @@
     if (!def) return "percussive";
     var PERC = { kick: 1, snare: 1, clap: 1, chat: 1, ohat: 1, anvil: 1, rim: 1, shaker: 1 };
     if (PERC[def.type]) return "percussive";
+    if (def.kind === "synth" || def.type === "synth") return "melodic";     // native synth = melodic (Piano Roll target)
     if (def.type === "audio" || def.type === "sampler") return "melodic";   // recorded/loaded sounds read as melodic
     return def.tonal ? "melodic" : "percussive";
   };
@@ -773,7 +853,12 @@
     if (this.playMode === "timeline") {
       if (!this._tlEvents) this._tlEvents = this.timelineEvents();
       this._tlCursor = this._cursorForTick(tick);
-      if (this.isPlaying) this.nextStepTime = this.ctx.currentTime + 0.03;   // re-anchor look-ahead
+      if (this.isPlaying) {
+        this.nextStepTime = this.ctx.currentTime + 0.03;   // re-anchor look-ahead
+        // Phase 4: drop stale schedule points + re-seat the playhead anchor at the seek target so
+        // the audio-clock-driven playhead snaps cleanly instead of drifting from the old position.
+        this.notesInQueue = []; this._phPoint = { tick: tick, time: this.nextStepTime };
+      }
     }
     if (this.onPlayhead) this.onPlayhead(tick);
   };
@@ -1005,16 +1090,33 @@
     else if (this.playMode === "timeline") { this.syncAllRackClips(); this.recomputeTimelineLength(); this._tlEvents = this.timelineEvents(); this.playheadTick = this.timeline.loop.on ? this.timeline.loop.startTick : 0; this._tlCursor = this._cursorForTick(this.playheadTick); }
     else this.songStep = 0;
     this.nextStepTime = this.ctx.currentTime + 0.06; var self = this;
+    // Phase 4: seed the playhead anchor (tick + the ctx time it will sound) so _draw can project
+    // the live position straight off the audio clock from frame one.
+    this._phPoint = { tick: this.playheadTick, time: this.nextStepTime };
     this.timer = setInterval(function () { self._scheduler(); }, this.lookahead); this._draw();
   };
-  Engine.prototype.pause = function () { this.isPlaying = false; if (this.timer) { clearInterval(this.timer); this.timer = null; } this._killLaneVoices(); };   // Phase 8: silence ringing lane voices with a de-click ramp
-  Engine.prototype.stop = function () { this._finalizePerf(); this._resetParams(); this.pause(); this.stepIndex = 0; this.songStep = 0; this.playheadTick = 0; this._lastStep = -1; if (this.onStep) this.onStep(-1, -1); if (this.onPlayhead) this.onPlayhead(-1); };
+  Engine.prototype.pause = function () { this.isPlaying = false; if (this.timer) { clearInterval(this.timer); this.timer = null; } this._killLaneVoices(); this._killSynthVoices(); };   // Phase 8: silence ringing lane + synth voices with a de-click ramp
+  Engine.prototype.stop = function () { this._finalizePerf(); this._resetParams(); this.pause(); this.stepIndex = 0; this.songStep = 0; this.playheadTick = 0; this._lastStep = -1; this._phPoint = null; if (this.onStep) this.onStep(-1, -1); if (this.onPlayhead) this.onPlayhead(-1); };
   Engine.prototype.setMode = function (mode) { if (this.playMode === mode) return; this.playMode = mode; if (this.isPlaying) { this.pause(); this.start(mode); } };
   Engine.prototype._draw = function () {
     var self = this; if (!this.isPlaying) return; var now = this.ctx.currentTime, cur = null;
     while (this.notesInQueue.length && this.notesInQueue[0].time <= now) { cur = this.notesInQueue.shift(); }
-    if (cur && cur.tl) { if (this.onPlayhead) this.onPlayhead(cur.step); }
-    else if (cur && (cur.step !== this._lastStep || cur.bar >= 0)) { this._lastStep = cur.step; if (this.onStep) this.onStep(cur.step, cur.bar); }
+    if (this.playMode === "timeline") {
+      // Phase 4: drive the playhead directly off the transport's audio-clock sample offset — the
+      // single source of truth — instead of the 1/16 step grid. Each sounded step point (cur) is an
+      // EXACT (tick, ctx-time) pair; between points we project linearly from the audio clock
+      // (tick = point.tick + (now - point.time)/secPerTick), giving smooth, sample-accurate 1:1
+      // motion. Capped at one step ahead so a loop-wrap / look-ahead can't overshoot the point.
+      if (cur && cur.tl) this._phPoint = { tick: cur.step, time: cur.time };
+      var pp = this._phPoint;
+      if (pp && this.onPlayhead) {
+        var spt = this.secPerTick();
+        var live = pp.tick + (now - pp.time) / spt;
+        if (live < pp.tick) live = pp.tick;                              // before this point sounds
+        if (live > pp.tick + TICKS_PER_STEP) live = pp.tick + TICKS_PER_STEP;
+        this.onPlayhead(live);
+      }
+    } else if (cur && (cur.step !== this._lastStep || cur.bar >= 0)) { this._lastStep = cur.step; if (this.onStep) this.onStep(cur.step, cur.bar); }
     requestAnimationFrame(function () { self._draw(); });
   };
 
@@ -1109,6 +1211,23 @@
                 route: route, vol: src.vol, pan: 0, tonal: src.tonal, base: src.base, sampleId: src.id };
     this.channelDefs.push(def);
     // add a fresh step row for this channel in EVERY bank
+    this.banks.forEach(function (bk) { bk.steps[id] = freshStepRow(patLen(bk)); });
+    this._wireChannel(def);
+    this.focus = id;
+    return def;
+  };
+
+  // Synth Suite (Phase 1): append a native polyphonic SYNTH track (kind:'synth'). It carries an
+  // editable ADSR + waveform preset and is tonal so it routes into the Piano Roll + classifies as
+  // melodic. Wired into its own id-based mixer insert (route = max+1, capped 16) like any track.
+  Engine.prototype.addSynthTrack = function (name, wave) {
+    this.init();
+    var n = 1, id = "syn"; while (this.channels[id]) { id = "syn_" + (++n); }
+    var maxRoute = 0; this.channelDefs.forEach(function (c) { if (c.route > maxRoute) maxRoute = c.route; });
+    var def = { id: id, label: name || ("Synth" + (n > 1 ? " " + n : "")), type: "synth", kind: "synth", color: "#9d4edd",
+                route: Math.min(16, maxRoute + 1), vol: 0.7, pan: 0, tonal: true, base: 60,
+                synth: { wave: wave || "sawtooth", attack: 0.005, decay: 0.12, sustain: 0.7, release: 0.08 } };
+    this.channelDefs.push(def);
     this.banks.forEach(function (bk) { bk.steps[id] = freshStepRow(patLen(bk)); });
     this._wireChannel(def);
     this.focus = id;
@@ -1389,7 +1508,10 @@
       if (ev.kind === "audio") { var adur = ev.trimmed ? self.tickToSec(ev.lenTicks) : 0; self._playBuffer(octx, self.userBuffers[ev.bufferId], time, out, 0, 100, adur, self.tickToSec(ev.offsetTicks || 0), { gain: ev.gain, fadeIn: self.tickToSec(ev.fadeInTicks || 0), fadeOut: self.tickToSec(ev.fadeOutTicks || 0) }); return; }
       var semis = ev.pitch - (c.def.base || 0);
       var d = Math.max(ev.lenTicks * self.secPerTick() * 0.95, 0.08);
-      if (c.def.type === "sampler") self._playBuffer(octx, self.userBuffers[c.def.bufferId], time, out, semis, ev.vel);
+      // Synth Suite (Phase 1): bounce kind:'synth' tracks through the same ADSR oscillator voice as
+      // live playback (offline ctx -> no live-voice tracking / stealing), so the export matches.
+      if (c.def.kind === "synth") self._synthVoice(octx, time, out, ev.pitch, ev.vel, d, c.def.synth);
+      else if (c.def.type === "sampler") self._playBuffer(octx, self.userBuffers[c.def.bufferId], time, out, semis, ev.vel);
       else self._voice(octx, nb, c.def.type, time, out, semis, ev.vel, d);
     });
     var t0 = Date.now(), est = Math.max(2500, dur * 240);
@@ -1497,7 +1619,7 @@
       channels: this.channelDefs.map(function (c) {
         var live = self.channels[c.id] || {};
         return { id: c.id, label: c.label, type: c.type, kind: c.kind || (c.type === "audio" ? "audioLane" : "sampler"), audioLane: !!c.audioLane, color: c.color, route: c.route,
-                 base: c.base, tonal: c.tonal, sampleId: c.sampleId, bufferId: c.bufferId, userAudio: !!c.userAudio,
+                 base: c.base, tonal: c.tonal, sampleId: c.sampleId, bufferId: c.bufferId, userAudio: !!c.userAudio, synth: c.synth || null,
                  vol: live.vol != null ? live.vol : c.vol, pan: live.pan != null ? live.pan : c.pan,
                  muted: !!live.muted, solo: !!live.solo };
       }),
@@ -1547,7 +1669,8 @@
       (data.channels || []).forEach(function (c) {
         var def = { id: c.id, label: c.label, type: c.type, kind: c.kind || (c.type === "audio" ? "audioLane" : "sampler"), color: c.color, route: c.route,
                     vol: c.vol, pan: c.pan, tonal: c.tonal, base: c.base, sampleId: c.sampleId,
-                    bufferId: c.bufferId || c.id, userAudio: !!c.userAudio, audioLane: c.type === "audio" || !!c.audioLane };
+                    bufferId: c.bufferId || c.id, userAudio: !!c.userAudio, audioLane: c.type === "audio" || !!c.audioLane,
+                    synth: (c.kind === "synth" || c.type === "synth") ? (c.synth || { wave: "sawtooth", attack: 0.005, decay: 0.12, sustain: 0.7, release: 0.08 }) : null };
         self.channelDefs.push(def);
         self.banks.forEach(function (bk) { if (!bk.steps[c.id]) bk.steps[c.id] = freshStepRow(patLen(bk)); });
         self._wireChannel(def);

@@ -218,12 +218,19 @@
       var g = (clip.gain != null ? clip.gain : 1) + (e.deltaY < 0 ? 0.05 : -0.05);
       clip.gain = Math.max(0, Math.min(2, Math.round(g * 100) / 100)); commit();
     }
-    // ---- double-click empty lane body -> create a 1-bar clip ----
+    // ---- double-click disambiguation (locked decision 1): EMPTY area of a melody lane -> create a
+    // 1-bar MIDI clip there and open the Piano Roll on it. (An ACTIVE audio clip's own dbl-click
+    // handler opens the Waveform Editor — see clipEl below; the two bindings never clobber, because
+    // this only fires on the bare .tl-body, not on a clip element.) Audio lanes have no Piano Roll,
+    // so an empty dbl-click there is a no-op (edit takes via their clips / the Waveform Editor).
     function onLaneDbl(e, lane) {
       if (!e.target.classList.contains("tl-body")) return;
+      var chDef = E.channels[lane.id] && E.channels[lane.id].def;
+      if (chDef && (chDef.kind === "audioLane" || chDef.type === "audio")) return;   // audio lane: no Piano Roll
       var tick = snap(coords(e).x >= 0 ? x2t(coords(e).x) : 0);
       var clip = { id: E._newClipId(), kind: "midi", ch: lane.id, startTick: Math.max(0, tick), lengthTicks: TPB, notes: [] };
       clips.push(clip); setSel([clip.id]); commit();
+      if (props.onOpenClip) props.onOpenClip(clip);   // open the Piano Roll on the new clip
     }
     // ---- clipboard + delete (global keys, ignored in text fields) ----
     function selectedClips() { return clips.filter(function (c) { return sel.indexOf(c.id) >= 0; }); }
