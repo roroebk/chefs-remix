@@ -287,8 +287,10 @@
         style: { left: x, width: w, background: isAudio ? null : "color-mix(in srgb," + (lane.color || "var(--accent)") + " 26%, var(--surface-2))", borderColor: lane.color || "var(--accent)" },
         onMouseDown: function (e) { onClipDown(e, c); },
         onWheel: isAudio ? function (e) { onClipWheel(e, c); } : null,
-        onDoubleClick: function (e) { e.stopPropagation(); (props.onEditClip || props.onOpenClipFx) && (props.onEditClip ? props.onEditClip(c) : props.onOpenClipFx(c)); },
-        title: lane.label + (isAudio ? " audio take · scroll = gain · drag top corners = fade in/out" : " clip") + " · dbl-click → Clip Editor (Steps/Notes/FX)" + (isAudio ? "" : " · ✎ edit notes") + " · drag right edge to chop/trim" },
+        // Phase 10: an audio clip double-click opens the non-destructive Waveform Editor; a midi
+        // clip opens the Clip Editor (Steps/Notes/FX) as before.
+        onDoubleClick: function (e) { e.stopPropagation(); if (isAudio && props.onOpenWave) { props.onOpenWave(c); return; } (props.onEditClip || props.onOpenClipFx) && (props.onEditClip ? props.onEditClip(c) : props.onOpenClipFx(c)); },
+        title: lane.label + (isAudio ? " audio take · scroll = gain · drag top corners = fade in/out · dbl-click → Waveform Editor" : " clip · dbl-click → Clip Editor (Steps/Notes/FX) · ✎ edit notes") + " · drag right edge to chop/trim" },
         h("span", { className: "tl-clip-lbl" }, (isAudio ? (c.name || "Take") : lane.label) + (isAudio && gainPct !== 100 ? "  " + gainPct + "%" : "")),
         (isAudio && (c.fadeInTicks || 0) > 0 ? h("div", { className: "tl-fade-ramp in", style: { width: Math.max(2, t2x(c.fadeInTicks)) } }) : null),
         (isAudio && (c.fadeOutTicks || 0) > 0 ? h("div", { className: "tl-fade-ramp out", style: { width: Math.max(2, t2x(c.fadeOutTicks)) } }) : null),
@@ -419,7 +421,10 @@
           lanes.length ? lanes.map(function (lane) {
             var laneClips = clips.filter(function (c) { return c.ch === lane.id; });
             var row = h("div", { className: "tl-row", style: { height: TL_LANE } },
-              h("div", { className: "tl-head", style: { width: TL_HEAD } },
+              // Phase 6: click/double-click a lane header -> focus the track, which selects its insert
+              // (by route id) so the Mixer scrolls to + highlights that strip (no separate FX window).
+              h("div", { className: "tl-head" + (E.focus === lane.id ? " focused" : ""), style: { width: TL_HEAD }, title: "Click to focus this track's mixer strip",
+                  onClick: function (e) { props.onFocusStrip && props.onFocusStrip(lane.id); }, onDoubleClick: function (e) { e.stopPropagation(); props.onFocusStrip && props.onFocusStrip(lane.id); } },
                 h("span", { className: "tl-led", style: { background: lane.color } }),
                 (function () {
                   // instrument/melody glyph — drum for percussive lanes, note for melodic (Pass 5 T1)

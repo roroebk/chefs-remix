@@ -142,7 +142,6 @@
     var ex = useState(function () { var o = {}; var f = getFactory(); o[f.id] = true; (f.children || []).forEach(function (c) { if (/drum/i.test(c.name)) o[c.id] = true; }); return o; }); var expanded = ex[0], setExpanded = ex[1];
     var lm = useState(false); var showLink = lm[0], setShowLink = lm[1];
     var qs = useState(""); var query = qs[0], setQuery = qs[1];
-    var dz = useState(false); var dragOver = dz[0], setDragOver = dz[1];   // OS file drag-over highlight
     var fileRef = React.useRef(null);                                       // hidden picker for "Add File(s)"
     var melodyRef = React.useRef(null);                                     // hidden picker for "Add Melody File" (Fix 1)
     var factory = getFactory();
@@ -250,11 +249,10 @@
         h("div", { className: "tree-sec" }, hits.length + " RESULT" + (hits.length === 1 ? "" : "S")),
         h("div", { className: "tree" }, hits.length ? hits.map(function (x) { return sampleRow(x.s, 10, x.path); }) : h("div", { className: "tree-empty" }, "No samples match “" + query + "”")));
     } else if (tab === "files") {
-      body = h("div", {
-        className: "brws" + (dragOver ? " dropping" : ""),
-        onDragOver: function (e) { if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.indexOf("Files") < 0) return; e.preventDefault(); e.dataTransfer.dropEffect = "copy"; if (!dragOver) setDragOver(true); },
-        onDragLeave: function (e) { if (e.target === e.currentTarget) setDragOver(false); },
-        onDrop: function (e) { if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return; e.preventDefault(); setDragOver(false); addFiles(e.dataTransfer.files); } },
+      // Phase 7: drag-and-drop ingestion (dragover/drop/dragleave overlay) was removed — it was the
+      // buggy path. Importing now goes solely through the explicit pickers below (Add File(s) /
+      // Add Melody File) and Link Instrumental Folder. No window/layout drag listeners remain.
+      body = h("div", { className: "brws" },
         h("div", { className: "fb-improw" },
           h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, onClick: function () { fileRef.current && fileRef.current.click(); } }, h(I.Plus, { width: 15, height: 15 }), "Add File(s)"),
           h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, title: "Link an instrumental/drum folder as Sampler channels (16-step grid + Piano Roll + FX)", onClick: function () { setShowLink(true); } }, h(I.Folder, { width: 15, height: 15 }), "Link Instrumental Folder")),
@@ -262,7 +260,6 @@
           h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, title: "Import a melody/audio file as a continuous Audio Lane clip on the timeline (no step block)", onClick: function () { melodyRef.current && melodyRef.current.click(); } }, h(I.Wave, { width: 15, height: 15 }), "Add Melody File")),
         h("input", { type: "file", ref: fileRef, accept: "audio/*,video/*", multiple: true, style: { display: "none" }, onChange: function (e) { addFiles(e.target.files); e.target.value = ""; } }),
         h("input", { type: "file", ref: melodyRef, accept: "audio/*,video/*", multiple: true, style: { display: "none" }, onChange: function (e) { addMelodies(e.target.files); e.target.value = ""; } }),
-        h("div", { className: "fb-drophint" }, h(I.Wave, { width: 13, height: 13 }), " Drop audio or screen-recording files to import"),
         h("div", { className: "tree" },
           h("div", { className: "tree-sec" }, "LIBRARY"),
           renderNode(factory, 0, false)));

@@ -5,6 +5,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — FINAL BUILD: linear-timeline refactor (schema 4)
+- **Schema 3 → 4 migration.** `hydrate` now auto-migrates saved schema-3
+  projects (banks / loop / activePattern) into the pure linear-clip model:
+  every on-step / piano-roll note becomes an absolute-tick MIDI clip, then the
+  banks are emptied so the live rack-mirror can't re-add them (no double-trigger).
+  De-dup guard skips flattening a bank already represented by a real clip at
+  bar 0. Migration also **heals duplicate / missing clip ids** and reseeds the
+  clip-id counter, so loading clip-heavy projects no longer collides ids (which
+  previously made split / clip-edit resolve the wrong clip + threw React key
+  warnings). The "new" fixture (9 ch, 214 clips) loads + plays identically.
+- **Timeline is the sole transport.** Engine default `playMode` is now
+  `"timeline"` (absolute-tick scheduler); the Pattern [1]–[4] selector pills
+  were removed from the Transport.
+- **Step-mod relocated into the mixer.** The standalone TRACK FX panel was
+  deleted; its INSERT FX RACK + STEP MODULATION (Velocity/Pitch/Pan/Release)
+  lanes now live in the Mixer's focused-strip expanded view, which resolves the
+  focused channel's insert strictly by route id.
+- **Track focus.** Clicking a timeline lane header focuses the track, selects
+  its insert by id, and scrolls/highlights that mixer strip.
+
+### Added
+- **Waveform editor (audio clips).** Double-click a linear audio clip to open a
+  non-destructive modal: canvas waveform of the clip's windowed buffer, clip
+  gain, fade-in/out, and split-at-position. Edits touch clip metadata only; the
+  source buffer is never mutated (splits reference the same buffer).
+
+### Fixed
+- **Melody lanes no longer ring through pause.** Live `AudioBufferSourceNode`
+  voices are tracked; on pause/stop they are de-click-ramped to zero over ~8ms
+  then stopped (never a hard `stop(0)`), with a synchronous up-front clear so
+  rapid play/pause/play can't leave overlapping voices.
+- **File-sidebar drag-and-drop** (the buggy overlay + dragover/drop/dragleave
+  listeners) was removed; import now goes through the explicit Add File(s) /
+  Add Melody File pickers + Link Instrumental Folder (sidebar + library kept).
+
 ### Fixed
 - **Playback now plays every instrument in the project.** Timeline mode only
   plays clips on the timeline, and rack/pattern content was mirrored there only

@@ -130,9 +130,6 @@
         h("div", { className: "knob-wrap" }, h("span", { className: "lbl", style: { writingMode: "horizontal-tb" } }, "SWING"),
           h("input", { className: "slider swing-mini", type: "range", min: 0, max: 1, step: 0.01, value: props.swing, onChange: function (e) { props.onSwing(parseFloat(e.target.value)); } }),
           h("span", { className: "mono", style: { fontSize: 12, color: "var(--accent)", width: 34 } }, Math.round(props.swing * 100) + "%"))),
-      h("div", { className: "t-group" },
-        h("span", { className: "lbl", style: { color: "var(--faint)", fontSize: 9, letterSpacing: "0.16em" } }, "PATTERN"),
-        h("div", { className: "pat-pills" }, [0, 1, 2, 3].map(function (i) { return h("button", { key: i, className: "pat-pill" + (props.active === i ? " on" : ""), onClick: function () { props.onPattern(i); } }, i + 1); }))),
       h("div", { className: "t-group spectrum-wrap" }, h(W.SpectrumAnalyzer, null)),
       h("button", { className: "btn", onClick: props.onExport }, [h(I.Download, { width: 16, height: 16, key: 1 }), "Export"]));
   }
@@ -350,26 +347,83 @@
         h("div", { className: "modal-foot" }, h("button", { className: "btn primary", onClick: props.onClose }, "Done"))));
   }
 
-  // ---------- per-track FX + Step Modulation panel (Pass 3 T6) ----------
-  // One cohesive panel for the selected track: its insert FX slot stack on top, then the
-  // relocated Graph Editor (Velocity/Pitch/Pan/Release) as a "STEP MODULATION" section beneath.
-  // Reuses window.GraphEditor verbatim — only its mount point moved.
-  function TrackFxPanel(props) {
-    var ch = props.ch; if (!ch) return h(EmptyPane, { title: "No track selected", sub: "Select a timeline lane to edit its FX + step modulation." });
-    var insId = (E.channels[ch.id] && E.channels[ch.id].route) || ch.route;
-    var ins = E.inserts[insId];
-    return h("div", { className: "trackfx" },
-      h("div", { className: "pane-head" },
-        h("span", { className: "pt" }, "Track FX"),
-        h("span", { className: "badge", style: { background: "color-mix(in srgb," + ch.color + " 18%, var(--surface-3))", color: ch.color } }, ch.label),
-        h("span", { className: "sub" }, "Insert M" + ("0" + insId).slice(-2))),
-      ins ? h("div", { className: "trackfx-slots" }, ins.fx.map(function (s, si) {
-        return h("button", { key: si, className: "ce-slot" + (s.type ? " filled" : "") + (s.bypass ? " byp" : ""),
-          title: "Slot " + (si + 1) + (s.type ? " · " + (FXMETA[s.type] ? FXMETA[s.type].label : s.type) : " · empty"),
-          onClick: function () { props.onOpenFx(insId, si); } }, s.type ? (FXMETA[s.type] ? FXMETA[s.type].label : s.type) : (si + 1));
-      })) : null,
-      h("div", { className: "trackfx-modlbl" }, "STEP MODULATION"),
-      h(window.GraphEditor, { ch: ch, pattern: props.pattern, rev: props.rev, playStep: props.playStep, onSet: props.onSet, embedded: true }));
+  // Phase 5: the standalone TRACK FX panel was deleted — its INSERT FX RACK + STEP MODULATION
+  // lanes now live inside the Mixer's focused-strip expanded view (FocusStripView, file 07),
+  // which resolves the focused channel's insert strictly by route id.
+
+  // ---------- Phase 10: non-destructive waveform editor (audio clips) ----------
+  // Opens on double-click of a linear audio clip. Reads the clip's raw AudioBuffer, draws a
+  // downsampled peak waveform on a <canvas>, and edits ONLY clip metadata — clip gain, fade-in /
+  // fade-out, and split-at-position. The source buffer is never mutated; a split creates a new
+  // clip object referencing the same buffer with adjusted in/out points (engine.splitClipAt).
+  function WaveEditor(props) {
+    var clip = props.clip, cref = useRef(null);
+    var rs = useState(0); var bump = function () { rs[1](function (x) { return x + 1; }); props.commit && props.commit(); };
+    var buf = E.userBuffers[clip.bufferId];
+    var bufDur = buf ? buf.duration : 0;
+    var offsetSec = E.tickToSec(clip.offsetTicks || 0);
+    var clipDurSec = clip.trimmed ? E.tickToSec(clip.lengthTicks) : Math.max(0, bufDur - offsetSec);
+    var sp = useState(0.5); var splitPos = sp[0], setSplitPos = sp[1];   // 0..1 within the clip window
+    function gain() { return clip.gain != null ? clip.gain : 1; }
+    function fadeFrac(t) { return clipDurSec > 0 ? Math.max(0, Math.min(0.5, E.tickToSec(t || 0) / clipDurSec)) : 0; }
+    useEffect(function () {
+      var cv = cref.current; if (!cv) return; var ctx = cv.getContext("2d");
+      var r = cv.getBoundingClientRect(), Wd = cv.width = Math.max(8, Math.floor(r.width * 2)), Hd = cv.height = Math.max(8, Math.floor(r.height * 2));
+      ctx.clearRect(0, 0, Wd, Hd);
+      ctx.fillStyle = "rgba(157,78,221,0.06)"; ctx.fillRect(0, 0, Wd, Hd);
+      var peaks = (clip.peaks && clip.peaks.length) ? clip.peaks : (buf ? E.computePeaks(buf, 600) : []);
+      var n = peaks.length, mid = Hd / 2, g = gain();
+      if (n && bufDur > 0) {
+        // only the windowed slice [offset, offset+dur] of the buffer is what this clip plays
+        var i0 = Math.floor((offsetSec / bufDur) * n), i1 = Math.max(i0 + 1, Math.floor(((offsetSec + clipDurSec) / bufDur) * n));
+        var span = Math.max(1, i1 - i0);
+        ctx.strokeStyle = "rgba(157,78,221,0.95)"; ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (var x = 0; x < Wd; x++) {
+          var pi = i0 + Math.floor((x / Wd) * span); if (pi < 0 || pi >= n) continue;
+          var a = Math.min(1, peaks[pi] * g);
+          ctx.moveTo(x + 0.5, mid - a * mid * 0.96); ctx.lineTo(x + 0.5, mid + a * mid * 0.96);
+        }
+        ctx.stroke();
+      }
+      ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(Wd, mid); ctx.stroke();
+      // fade wedges
+      var fi = fadeFrac(clip.fadeInTicks) * Wd, fo = fadeFrac(clip.fadeOutTicks) * Wd;
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      if (fi > 0) { ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(fi, 0); ctx.lineTo(0, Hd); ctx.closePath(); ctx.fill(); }
+      if (fo > 0) { ctx.beginPath(); ctx.moveTo(Wd, 0); ctx.lineTo(Wd - fo, 0); ctx.lineTo(Wd, Hd); ctx.closePath(); ctx.fill(); }
+      // split marker
+      var sx = splitPos * Wd; ctx.strokeStyle = "#ffb338"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, Hd); ctx.stroke();
+    }, [rs[0], clip.id, clip.gain, clip.fadeInTicks, clip.fadeOutTicks, clip.lengthTicks, clip.offsetTicks, splitPos]);
+    function setGain(v) { clip.gain = v; bump(); }
+    function setFadeIn(frac) { clip.fadeInTicks = Math.round(E.secToTick(frac * clipDurSec)); bump(); }
+    function setFadeOut(frac) { clip.fadeOutTicks = Math.round(E.secToTick(frac * clipDurSec)); bump(); }
+    function doSplit() {
+      var absTick = clip.startTick + Math.round(splitPos * clip.lengthTicks);
+      var rid = E.splitClipAt(clip.id, absTick);
+      if (rid) { props.commit && props.commit(); props.toast && props.toast("Clip split into 2"); props.onClose(); }
+      else { props.toast && props.toast("Split point must be inside the clip"); }
+    }
+    function reset() { clip.gain = 1; clip.fadeInTicks = 0; clip.fadeOutTicks = 0; bump(); }
+    return h("div", { className: "overlay", onClick: function (e) { if (e.target === e.currentTarget) props.onClose(); } },
+      h("div", { className: "modal wave-editor", style: { width: 760, maxWidth: "94vw" } },
+        h("div", { className: "modal-head" },
+          h("div", { className: "mi" }, h(I.Wave, null)),
+          h("h3", null, "Waveform Editor · ", clip.name || "Audio Clip",
+            h("span", { className: "sub", style: { marginLeft: 8 } }, clipDurSec.toFixed(2) + "s" + (clip.trimmed ? " · trimmed" : " · full"))),
+          h("button", { className: "tbtn", style: { marginLeft: "auto", width: 32, height: 32 }, onClick: props.onClose }, h(I.X, { width: 16, height: 16 }))),
+        h("div", { className: "modal-body" },
+          buf ? h("canvas", { ref: cref, className: "wave-canvas", style: { width: "100%", height: 200 } })
+              : h(EmptyPane, { title: "Audio still loading", sub: "The clip's buffer is being restored — reopen in a moment." }),
+          h("div", { className: "wave-ctrls" },
+            h("div", { className: "wave-ctl" }, h("label", null, "Clip Gain"), h("input", { type: "range", min: 0, max: 2, step: 0.01, value: gain(), onChange: function (e) { setGain(parseFloat(e.target.value)); } }), h("span", { className: "mono" }, Math.round(gain() * 100) + "%")),
+            h("div", { className: "wave-ctl" }, h("label", null, "Fade In"), h("input", { type: "range", min: 0, max: 0.5, step: 0.01, value: fadeFrac(clip.fadeInTicks), onChange: function (e) { setFadeIn(parseFloat(e.target.value)); } }), h("span", { className: "mono" }, Math.round(E.tickToSec(clip.fadeInTicks || 0) * 1000) + "ms")),
+            h("div", { className: "wave-ctl" }, h("label", null, "Fade Out"), h("input", { type: "range", min: 0, max: 0.5, step: 0.01, value: fadeFrac(clip.fadeOutTicks), onChange: function (e) { setFadeOut(parseFloat(e.target.value)); } }), h("span", { className: "mono" }, Math.round(E.tickToSec(clip.fadeOutTicks || 0) * 1000) + "ms")),
+            h("div", { className: "wave-ctl" }, h("label", null, "Split At"), h("input", { type: "range", min: 0, max: 1, step: 0.001, value: splitPos, onChange: function (e) { setSplitPos(parseFloat(e.target.value)); } }), h("button", { className: "btn", onClick: doSplit }, "✂ Split"))),
+          h("p", { className: "sub", style: { marginTop: 4 } }, "Non-destructive — edits change clip metadata only; the source audio is never modified.")),
+        h("div", { className: "modal-foot" },
+          h("button", { className: "btn", onClick: reset }, "Reset"),
+          h("button", { className: "btn primary", onClick: props.onClose }, "Done"))));
   }
 
   // ---------- app ----------
@@ -411,6 +465,7 @@
     var lc = useState(false); var railCol = lc[0], setRailCol = lc[1];
     var ecS = useState(null); var editClip = ecS[0], setEditClip = ecS[1];   // clip being isolated in the Piano Roll
     var ceS = useState(null); var clipEdit = ceS[0], setClipEdit = ceS[1];   // clip open in the Clip Editor overlay (Task 4)
+    var weS = useState(null); var waveClip = weS[0], setWaveClip = weS[1];   // Phase 10: audio clip open in the Waveform Editor
     var ps = useState(-1); var playStep = ps[0], setPlayStep = ps[1];
     var pbar = useState(-1); var playBar = pbar[0], setPlayBar = pbar[1];
     var fx = useState(null); var fxModal = fx[0], setFxModal = fx[1];
@@ -473,7 +528,7 @@
     function togglePlay() { if (E.isPlaying) { E.pause(); setPlaying(false); setPlayStep(-1); } else { E.start(mode); setPlaying(true); } }
     function stop() { E.stop(); setPlaying(false); setPlayStep(-1); setPlayBar(-1); }
     function pattern(i) { E.setActivePattern(i); setActive(i); bump(); }
-    function doFocus(id) { setEditClip(null); setFocus(id); E.setFocus(id); var ch = E.channels[id]; if (ch && ch.def.tonal) lastTonal.current = id; }
+    function doFocus(id) { setEditClip(null); setFocus(id); E.setFocus(id); var ch = E.channels[id]; if (ch) { if (ch.def.tonal) lastTonal.current = id; if (ch.route) setSelIns(ch.route); } }   // Phase 6: focusing a track selects its insert (by id) -> Mixer scrolls/highlights that strip
 
     function toggleStep(id, i) { E.toggleStep(id, i); bump(); }
     function setStep(id, i, k, v) { E.setStepParam(id, i, k, v); bump(); }
@@ -639,13 +694,13 @@
               h("button", { className: "hdr-btn" + (musTyping ? " on" : ""), title: "Musical typing — ASDF row plays the focused track (Z/X = octave)", onClick: function () { var nx = !musTyping; setMusTyping(nx); musRef.current = nx; } }, "⌨ Keys"),
               h("button", { className: "hdr-btn" + (midiOn ? " on" : ""), title: "Enable MIDI controller input", onClick: function () { if (midiOn) return; E.enableMIDI(function (ok, info) { if (ok) { setMidiOn(true); toast("MIDI ready · " + info + " input(s)", h(I.Piano, { width: 16, height: 16 })); } else { toast("MIDI: " + info, h(I.X, null)); } }); } }, "MIDI"),
               h("button", { className: "hdr-btn" + (perfArm ? " on" : ""), title: "Arm note recording — play (keys/MIDI) while the Timeline rolls to capture notes", onClick: function () { var nx = !perfArm; setPerfArm(nx); E.armPerf(nx); } }, "● Arm"),
-              h("div", { className: "auth" + (playing ? " live" : "") }, h("span", { className: "pulse" }), playing ? [h("span", { key: 1 }, mode === "song" ? "Playing " : "Looping "), h("b", { key: 2 }, mode === "song" ? "arrangement" : "Pattern " + (active + 1))] : "Stopped")),
+              h("div", { className: "auth" + (playing ? " live" : "") }, h("span", { className: "pulse" }), playing ? [h("span", { key: 1 }, "Playing "), h("b", { key: 2 }, "timeline")] : "Stopped")),
             h("div", { className: "center" },
               h("div", { className: "top-pane" },
                 h("div", { className: "pane-head" },
                   h("span", { className: "pt" }, view === "rack" ? "Channel Rack" : view === "piano" ? (editingClip ? "Piano Roll · Clip" : "Piano Roll") : "Timeline"),
-                  h("span", { className: "badge" }, "PAT " + (active + 1)),
-                  h("span", { className: "sub" }, "16 steps · 1 bar · 140 BPM"),
+                  h("span", { className: "badge" }, "LINEAR"),
+                  h("span", { className: "sub" }, "Absolute-tick arrangement · " + bpm + " BPM"),
                   view === "rack" ? h("div", { className: "ph-act" },
                     h("button", { className: "mini-btn", onClick: function () { E.clearPattern(); bump(); toast("Pattern " + (active + 1) + " cleared", h(I.Reset, null)); } }, [h(I.Reset, { width: 13, height: 13, key: 1 }), "Clear"]),
                     h("button", { className: "mini-btn", onClick: function () { randomize(active, bump, toast); } }, [h(I.Dice, { width: 13, height: 13, key: 1 }), "Spice"])) : null),
@@ -658,15 +713,17 @@
                         : prCh
                           ? h(window.PianoRoll, { ch: prCh, pattern: E.banks[active], steps: E.getPatternLength(active) * 16, lengthBars: E.getPatternLength(active), onSetLength: function (b) { E.setPatternLength(b, active); bump(); }, playStep: mode === "pattern" ? playStep : -1, rev: rev, onAddNote: function (c, p, s, l) { return E.addNote(c, p, s, l); }, onUpdateNote: function (id, patch) { E.updateNote(id, patch); }, onRemoveNote: function (id) { E.removeNote(id); }, commit: bump })
                           : h(EmptyPane, { title: "No tonal instrument", sub: "Add a melodic track (it routes here automatically)." }))
-                    : h(window.Timeline, { channels: E.channelDefs, playheadTick: playTick, tool: toolMode, onSetTool: setToolMode, onCommit: bump, onDeleteTrack: deleteTrack, onScrub: function (tick) { E.seek(tick); setPlayTick(tick); }, onOpenClip: function (clip) { doFocus(clip.ch); setView("piano"); setEditClip(clip); }, onOpenClipFx: openClipFx, onEditClip: function (clip) { doFocus(clip.ch); setClipEdit(clip); }, onToast: function (m) { toast(m, h(I.Mic, { width: 16, height: 16 })); } })),
+                    : h(window.Timeline, { channels: E.channelDefs, playheadTick: playTick, tool: toolMode, onSetTool: setToolMode, onCommit: bump, onDeleteTrack: deleteTrack, onFocusStrip: doFocus, onScrub: function (tick) { E.seek(tick); setPlayTick(tick); }, onOpenClip: function (clip) { doFocus(clip.ch); setView("piano"); setEditClip(clip); }, onOpenClipFx: openClipFx, onEditClip: function (clip) { doFocus(clip.ch); setClipEdit(clip); }, onOpenWave: function (clip) { doFocus(clip.ch); setWaveClip(clip); }, onToast: function (m) { toast(m, h(I.Mic, { width: 16, height: 16 })); } })),
               h("div", { className: "dashboard" },
-                h(window.Mixer, { inserts: insertState, selected: selIns, master: master, onSelect: setSelIns, onVol: insVol, onPan: insPan, onMute: insMute, onSolo: insSolo, onMasterVol: function (v) { E.setMaster(v); setMaster(v); }, onFxClick: function (id, slot) { setFxModal({ id: id, slot: slot }); }, onCommit: bump }),
-                h(TrackFxPanel, { ch: focusCh, pattern: E.banks[active], rev: rev, playStep: mode === "pattern" ? playStep : -1, onSet: setStep, onOpenFx: function (id, slot) { setSelIns(id); setFxModal({ id: id, slot: slot }); } }))))),
+                h(window.Mixer, { inserts: insertState, selected: selIns, master: master, focusCh: focusCh, pattern: E.banks[active], rev: rev, playStep: mode === "pattern" ? playStep : -1, onSetStep: setStep, onSelect: setSelIns, onVol: insVol, onPan: insPan, onMute: insMute, onSolo: insSolo, onMasterVol: function (v) { E.setMaster(v); setMaster(v); }, onFxClick: function (id, slot) { setFxModal({ id: id, slot: slot }); }, onCommit: bump }))))),
         (clipEdit && E.timeline.clips.indexOf(clipEdit) >= 0) ? h(ClipEditor, {
           clip: clipEdit, chDef: (E.channels[clipEdit.ch] && E.channels[clipEdit.ch].def) || prCh, commit: bump,
           api: { toPattern: clipToPattern, add: clipAddNote, upd: clipUpdNote, rem: clipRemNote },
           onOpenFx: function (insId, slot, clip) { setFxModal({ id: insId, slot: slot, clip: clip }); },
           onClose: function () { setClipEdit(null); } }) : null,
+        (waveClip && E.timeline.clips.indexOf(waveClip) >= 0) ? h(WaveEditor, {
+          clip: waveClip, commit: bump, toast: function (m) { toast(m, h(I.Wave, { width: 16, height: 16 })); },
+          onClose: function () { setWaveClip(null); } }) : null,
         fxModal ? h(FXModal, { id: fxModal.id, slot: fxModal.slot, clip: fxModal.clip, onClose: function () { setFxModal(null); }, commit: bump }) : null,
         showEx ? h(RenderModal, { onClose: function () { setShowEx(false); }, onStopped: function () { setPlaying(false); setPlayStep(-1); }, toast: toast }) : null,
         h("div", { className: "toast-wrap" }, toasts.map(function (x) { return h("div", { className: "toast", key: x.id }, h("span", { className: "ti" }, x.ic), x.m); }))),

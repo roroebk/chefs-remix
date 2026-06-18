@@ -105,7 +105,7 @@
 
   function Engine() {
     this.ctx = null; this.master = null; this.masterAnalyser = null; this.limiter = null; this.noise = null;
-    this.tempo = 140; this.swing = 0; this.isPlaying = false; this.playMode = "pattern";
+    this.tempo = 140; this.swing = 0; this.isPlaying = false; this.playMode = "timeline";  // Phase 2: linear timeline is the sole live transport
     this.stepIndex = 0; this.songStep = 0; this.nextStepTime = 0;
     this.lookahead = 25; this.scheduleAhead = 0.12; this.timer = null; this.notesInQueue = [];
     this.channelDefs = []; this.insertDefs = INSERTS;          // blank slate — no instrument lanes until added
@@ -127,6 +127,10 @@
     this.PPQ = PPQ; this.TICKS_PER_BAR = TICKS_PER_BAR; this.TICKS_PER_STEP = TICKS_PER_STEP; this.SNAP_TICKS = SNAP_TICKS;
     this.onStep = null; this.onMeter = null; this._lastStep = -1; this.meterFps = 60; this._meterLast = 0;
     this.onPlayhead = null; this.playheadTick = 0; this._tlEvents = null; this._tlCursor = 0;   // timeline transport
+    // Phase 8: live AudioBufferSourceNode voices spawned by _playBuffer (lane clips / samplers).
+    // The transport doesn't otherwise track them, so pause/stop would leave long melody lanes
+    // ringing. Held here so pause/stop can de-click-ramp + stop them synchronously.
+    this._laneVoices = [];
   }
 
   // ---- audio graph ----------------------------------------------------------
@@ -331,6 +335,33 @@
     src.connect(g); g.connect(out);
     src.start(t, off);
     try { src.stop(t + playDur + 0.02); } catch (e) {}   // tail past the release so the ramp completes
+    // Phase 8: track LIVE voices only (never the offline render ctx) so pause/stop can silence them.
+    if (ctx === this.ctx) {
+      var self = this, voice = { src: src, gain: g };
+      this._laneVoices.push(voice);
+      src.onended = function () { var k = self._laneVoices.indexOf(voice); if (k >= 0) self._laneVoices.splice(k, 1); };
+    }
+  };
+  // Phase 8: synchronously de-click + stop every live buffer voice (lane clips / sampler one-shots)
+  // on transport pause/stop. Cancel scheduled gain, ramp to ~0 over 8ms, THEN stop — never a hard
+  // stop(0) at non-zero gain (that reintroduces the 808-tail click). The array is cleared up front
+  // so a rapid play/pause/play can't leave overlapping voices behind.
+  Engine.prototype._killLaneVoices = function () {
+    var ctx = this.ctx; if (!ctx) { this._laneVoices = []; return; }
+    var now = ctx.currentTime, R = 0.008, vs = this._laneVoices;
+    this._laneVoices = [];
+    for (var i = 0; i < vs.length; i++) {
+      var v = vs[i];
+      try {
+        var g = v.gain.gain;
+        g.cancelScheduledValues(now);
+        var cur = g.value; if (!(cur > 0.0001)) cur = 0.0001;
+        g.setValueAtTime(cur, now);
+        g.linearRampToValueAtTime(0.0001, now + R);
+        v.src.onended = null;
+        v.src.stop(now + R + 0.01);
+      } catch (e) {}
+    }
   };
   // Per-step modulation node (Fix 2): wrap the voice destination with an optional gain (dB
   // offset) + stereo pan so a single step can be louder/quieter and panned without touching the
@@ -976,7 +1007,7 @@
     this.nextStepTime = this.ctx.currentTime + 0.06; var self = this;
     this.timer = setInterval(function () { self._scheduler(); }, this.lookahead); this._draw();
   };
-  Engine.prototype.pause = function () { this.isPlaying = false; if (this.timer) { clearInterval(this.timer); this.timer = null; } };
+  Engine.prototype.pause = function () { this.isPlaying = false; if (this.timer) { clearInterval(this.timer); this.timer = null; } this._killLaneVoices(); };   // Phase 8: silence ringing lane voices with a de-click ramp
   Engine.prototype.stop = function () { this._finalizePerf(); this._resetParams(); this.pause(); this.stepIndex = 0; this.songStep = 0; this.playheadTick = 0; this._lastStep = -1; if (this.onStep) this.onStep(-1, -1); if (this.onPlayhead) this.onPlayhead(-1); };
   Engine.prototype.setMode = function (mode) { if (this.playMode === mode) return; this.playMode = mode; if (this.isPlaying) { this.pause(); this.start(mode); } };
   Engine.prototype._draw = function () {
@@ -1422,7 +1453,41 @@
   }
 
   // ---- session serialization (PARAMETERS ONLY — never live audio nodes) ------
-  var SCHEMA = 3;
+  var SCHEMA = 4;            // v4 (FINAL BUILD): linear timeline is authoritative; banks liquidated on load
+  // ---- Phase 1: schema 3 -> 4 load-time migrator (pattern banks -> pure linear clips) ----
+  // Non-destructively converts a saved schema-3 project (banks / loop / activePattern) into the
+  // schema-4 linear model: every channel's on-step / piano-roll content becomes an absolute-tick
+  // MIDI timeline clip, the banks are then emptied so the live _rack mirror can never re-add them
+  // (that would double-trigger every note). DE-DUP GUARD: a bank is NOT flattened for a channel
+  // that is already represented by a real (non-_rack) clip at bar 0 — so a project carrying BOTH
+  // bank steps and timeline clips migrates without duplicates. Operates on the raw data object
+  // (no live nodes), so it is safe to run before the rest of hydrate().
+  Engine.prototype._migrateV3toV4 = function (data) {
+    var TPB = TICKS_PER_BAR, TPS = TICKS_PER_STEP;
+    data.timeline = data.timeline || { clips: [], loop: { startTick: 0, endTick: 16 * TPB, on: true }, lengthTicks: 32 * TPB, automation: {} };
+    // drop transient rack-mirror clips — bank content is re-materialized as permanent clips below
+    var clips = (data.timeline.clips || []).filter(function (c) { return !c._rack; });
+    var chDefs = data.channels || [], seq = 0;
+    (data.banks || []).forEach(function (bank, bIdx) {
+      if (!bank || !bank.steps) return;
+      chDefs.forEach(function (ch) {
+        if (ch.audioLane || ch.type === "audio") return;                 // audio lanes carry takes, not steps
+        var row = bank.steps[ch.id] || [], notes = [];
+        for (var i = 0; i < row.length; i++) { var st = row[i]; if (st && st.on) notes.push({ pitchTick: i * TPS, pitch: (ch.base || 0) + (ch.tonal ? (st.pitch || 0) : 0), lenTicks: Math.max(1, (st.len || 1)) * TPS, vel: st.vel }); }
+        (bank.notes || []).forEach(function (nt) { if (nt.ch === ch.id) notes.push({ pitchTick: Math.round(nt.start * TPS), pitch: nt.pitch, lenTicks: Math.max(1, Math.round(nt.len * TPS)), vel: nt.vel }); });
+        if (!notes.length) return;
+        // de-dup: already represented by a real clip for this channel at bar 0 -> skip
+        if (clips.some(function (c) { return c.ch === ch.id && c.kind === "midi" && (c.startTick || 0) === 0; })) return;
+        var end = 0; notes.forEach(function (n) { var e = n.pitchTick + n.lenTicks; if (e > end) end = e; });
+        clips.push({ id: "mig" + (bIdx) + "_" + ch.id + "_" + (seq++), kind: "midi", ch: ch.id, startTick: 0, lengthTicks: Math.max(TPB, Math.ceil(end / TPB) * TPB), notes: notes });
+      });
+      // liquidate: empty the bank so syncAllRackClips() can't re-mirror it on play (no double-trigger)
+      bank.steps = {}; bank.notes = [];
+    });
+    data.timeline.clips = clips;
+    data.schema = 4;
+    return data;
+  };
   Engine.prototype.serialize = function () {
     var self = this;
     return {
@@ -1456,7 +1521,10 @@
 
   // rebuild engine state + FRESH audio nodes from saved params. Returns true on success.
   Engine.prototype.hydrate = function (data) {
-    if (!data || data.schema !== SCHEMA) return false;   // schema mismatch -> caller boots empty
+    if (!data) return false;
+    // Phase 1: accept v4 natively; auto-migrate v3 saves (incl. the "new" fixture) to v4 in place.
+    if (data.schema === 3) { try { data = this._migrateV3toV4(data); } catch (e) { console.error("[migrate v3->v4] failed:", e); return false; } }
+    if (data.schema !== SCHEMA) return false;            // unknown/older schema -> caller boots empty
     this.init();
     this._hydrating = true;                               // guard: blocks autosave mid-rebuild
     var self = this;
@@ -1509,6 +1577,21 @@
         if (data.timeline.loop) this.timeline.loop = data.timeline.loop;
         if (data.timeline.lengthTicks) this.timeline.lengthTicks = data.timeline.lengthTicks;
         this.timeline.automation = data.timeline.automation || {};
+        // reseed the clip-id counter past every loaded "clip_N" id so newly created clips (melody
+        // import / split / record) can never collide with a loaded id — a collision would make
+        // splitClipAt / clip-edit / setClipRoute resolve the WRONG clip by id (latent before v4,
+        // now routine since whole projects load as clips).
+        var maxSeq = this._clipSeq || 0;
+        this.timeline.clips.forEach(function (c) { var m = /^clip_(\d+)$/.exec(c.id || ""); if (m) { var v = parseInt(m[1], 10); if (v > maxSeq) maxSeq = v; } });
+        // HEAL duplicate / missing clip ids (older saves written before the counter was reseeded
+        // could contain colliding ids -> React key collisions + wrong-clip edits). Reassign any
+        // repeat or blank id to a fresh unique one. Idempotent for already-unique projects.
+        var seenIds = {};
+        this.timeline.clips.forEach(function (c) {
+          if (!c.id || seenIds[c.id]) { c.id = "clip_" + (++maxSeq); }
+          seenIds[c.id] = true;
+        });
+        this._clipSeq = maxSeq;
         // restore recorded/imported audio-clip buffers from IndexedDB (async, error-isolated)
         this.timeline.clips.forEach(function (c) { if (c.kind === "audio" && c.bufferId) self._rehydrateSample(c.bufferId, c.bufferId); });
       } else { this.timeline.clips = []; }

@@ -135,19 +135,47 @@
         })));
   }
 
+  // Phase 4/5: the focused-strip expanded view. Hosts the INSERT FX RACK for the currently
+  // selected insert PLUS the relocated STEP MODULATION lanes (Velocity / Pitch / Pan / Release)
+  // for the focused channel — the home the standalone TRACK FX panel used to provide. The two
+  // are kept logically separate (insert effects vs. per-step note data) even in one container.
+  function FocusStripView(props) {
+    var E = window.engine, ch = props.focusCh;
+    var route = ch ? ((E.channels[ch.id] && E.channels[ch.id].route) || ch.route) : null;
+    var isStepCh = ch && !ch.audioLane && ch.type !== "audio";
+    return h("div", { className: "focusview" },
+      ch ? h("div", { className: "focusview-head" },
+        h("span", { className: "fv-dot", style: { background: ch.color || "var(--accent)" } }),
+        h("span", { className: "fv-name" }, ch.label),
+        route ? h("span", { className: "fv-ins mono" }, "Track → M" + ("0" + route).slice(-2)) : null) : null,
+      h(InsertFxRack, { selected: props.selected, onChange: props.onChange }),
+      isStepCh ? h("div", { className: "fv-stepmod" },
+        h("div", { className: "trackfx-modlbl" }, "STEP MODULATION · " + ch.label),
+        window.GraphEditor ? h(window.GraphEditor, { ch: ch, pattern: props.pattern, rev: props.rev, playStep: props.playStep, onSet: props.onSetStep, embedded: true }) : null)
+        : (ch ? h("div", { className: "fv-stepmod fv-audio" }, h("span", { className: "sub" }, "Audio lane — edit clips on the timeline (double-click a clip for the waveform editor).")) : null));
+  }
+
   function Mixer(props) {
+    var mxRef = useRef(null);
+    // Phase 6: when the selected insert changes (a strip click, or a timeline track focused/
+    // double-clicked which sets selected = that channel's route by id), scroll its strip into view.
+    useEffect(function () {
+      var cont = mxRef.current; if (!cont) return;
+      var el = cont.querySelector(".strip.sel");
+      if (el && el.scrollIntoView) { try { el.scrollIntoView({ behavior: "smooth", inline: "nearest", block: "nearest" }); } catch (e) { el.scrollIntoView(); } }
+    }, [props.selected]);
     return h("div", { className: "dash-mixer" },
       h("div", { className: "pane-head" },
         h("span", { className: "pt" }, "Mixer"),
         h("span", { className: "sub" }, props.inserts.length + " inserts · post-fader metering"),
         h("div", { className: "ph-act" }, h("span", { className: "sub mono" }, "M01–M16 · 00 = Master"))),
       h("div", { className: "mixer-body" },
-        h("div", { className: "mixer" },
+        h("div", { className: "mixer", ref: mxRef },
           props.inserts.map(function (ins) {
             return h(Strip, { key: ins.id, ins: ins, selected: props.selected === ins.id, onSelect: props.onSelect, onVol: props.onVol, onPan: props.onPan, onMute: props.onMute, onSolo: props.onSolo, onFxClick: props.onFxClick });
           }),
           h(MasterStrip, { master: props.master, onMasterVol: props.onMasterVol })),
-        h(InsertFxRack, { selected: props.selected, onChange: props.onCommit })));
+        h(FocusStripView, { selected: props.selected, focusCh: props.focusCh, pattern: props.pattern, rev: props.rev, playStep: props.playStep, onSetStep: props.onSetStep, onChange: props.onCommit })));
   }
 
   window.Mixer = Mixer;
