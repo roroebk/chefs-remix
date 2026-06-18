@@ -142,31 +142,15 @@
     var ex = useState(function () { var o = {}; var f = getFactory(); o[f.id] = true; (f.children || []).forEach(function (c) { if (/drum/i.test(c.name)) o[c.id] = true; }); return o; }); var expanded = ex[0], setExpanded = ex[1];
     var lm = useState(false); var showLink = lm[0], setShowLink = lm[1];
     var qs = useState(""); var query = qs[0], setQuery = qs[1];
-    var fileRef = React.useRef(null);                                       // hidden picker for "Add File(s)"
     var melodyRef = React.useRef(null);                                     // hidden picker for "Add Melody File" (Fix 1)
     var factory = getFactory();
 
-    // dropped / picked files land in a single "Imported Files" library folder (user-root, removable).
-    // They carry the real File (userFile:true) so preview / drag-to-track / double-click decode and
-    // play them exactly like any other sample — including a screen recording's extracted audio.
-    function importFolder() {
-      var f = getFactory();
-      var imp = f.children.filter(function (n) { return n.imported; })[0];
-      if (!imp) { imp = fold("Imported Files", [], "#9d4edd"); imp.userRoot = true; imp.imported = true; f.children.push(imp); }
-      return imp;
-    }
-    function addFiles(fileList) {
-      var files = Array.prototype.slice.call(fileList || []).filter(isMedia);
-      if (!files.length) { props.toast && props.toast("No audio/video files to import", h(I.X, null)); return; }
-      var imp = importFolder();
-      files.forEach(function (file) {
-        imp.children.push({ kind: "sample", id: uid(), name: file.name, type: "sampler", tonal: true, base: 60, previewSemis: 0, color: "#9d4edd", userFile: true, file: file });
-      });
-      expand(imp.id); rerender();
-      props.toast && props.toast("Imported " + files.length + " file" + (files.length === 1 ? "" : "s"), h(I.Wave, { width: 16, height: 16 }));
-    }
+    // NOTE: the "Add File(s)" button + its picker/importFolder helper were removed per the FINAL
+    // BUILD spec — sampler-style file import now lives solely on "Link Instrumental Folder", and
+    // single melody/audio imports on "Add Melody File" (continuous Audio Lane). The Factory Core
+    // library tree below is unaffected.
 
-    // Fix 1 — "Add Melody File": dual-path ingestion. Unlike Add File(s) (which makes step/grid
+    // Fix 1 — "Add Melody File": dual-path ingestion. Unlike the removed Add File(s) (which made step/grid
     // sampler rows), a melody import goes straight onto the linear timeline as a continuous Audio
     // Lane clip (full-length waveform, no step block needed). Delegated to the host (engine.addMelodyFile).
     function addMelodies(fileList) {
@@ -250,15 +234,14 @@
         h("div", { className: "tree" }, hits.length ? hits.map(function (x) { return sampleRow(x.s, 10, x.path); }) : h("div", { className: "tree-empty" }, "No samples match “" + query + "”")));
     } else if (tab === "files") {
       // Phase 7: drag-and-drop ingestion (dragover/drop/dragleave overlay) was removed — it was the
-      // buggy path. Importing now goes solely through the explicit pickers below (Add File(s) /
-      // Add Melody File) and Link Instrumental Folder. No window/layout drag listeners remain.
+      // buggy path. Importing now goes solely through the explicit pickers below. The "Add File(s)"
+      // button was removed entirely per the FINAL BUILD spec — only Link Instrumental Folder
+      // (sampler channels) and Add Melody File (continuous Audio Lane) remain.
       body = h("div", { className: "brws" },
         h("div", { className: "fb-improw" },
-          h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, onClick: function () { fileRef.current && fileRef.current.click(); } }, h(I.Plus, { width: 15, height: 15 }), "Add File(s)"),
           h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, title: "Link an instrumental/drum folder as Sampler channels (16-step grid + Piano Roll + FX)", onClick: function () { setShowLink(true); } }, h(I.Folder, { width: 15, height: 15 }), "Link Instrumental Folder")),
         h("div", { className: "fb-improw" },
           h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, title: "Import a melody/audio file as a continuous Audio Lane clip on the timeline (no step block)", onClick: function () { melodyRef.current && melodyRef.current.click(); } }, h(I.Wave, { width: 15, height: 15 }), "Add Melody File")),
-        h("input", { type: "file", ref: fileRef, accept: "audio/*,video/*", multiple: true, style: { display: "none" }, onChange: function (e) { addFiles(e.target.files); e.target.value = ""; } }),
         h("input", { type: "file", ref: melodyRef, accept: "audio/*,video/*", multiple: true, style: { display: "none" }, onChange: function (e) { addMelodies(e.target.files); e.target.value = ""; } }),
         h("div", { className: "tree" },
           h("div", { className: "tree-sec" }, "LIBRARY"),
