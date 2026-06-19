@@ -152,6 +152,7 @@
     var lm = useState(false); var showLink = lm[0], setShowLink = lm[1];
     var qs = useState(""); var query = qs[0], setQuery = qs[1];
     var melodyRef = React.useRef(null);                                     // hidden picker for "Add Melody File" (Fix 1)
+    var mmRef = React.useRef(null);                                         // hidden picker for "Melody Maker" (Phase 5, single file)
     var factory = getFactory();
 
     // NOTE: the "Add File(s)" button + its picker/importFolder helper were removed per the FINAL
@@ -167,6 +168,17 @@
       if (!files.length) { props.toast && props.toast("No audio/video files to add", h(I.X, null)); return; }
       if (!props.onAddMelody) return;
       props.onAddMelody(files);
+    }
+
+    // Phase 5 — "Melody Maker": a single audio file (WAV/MP3) becomes a polyphonic pitch-shifting
+    // sampler track (polySampler) you play across the Piano Roll. STRICTLY one file — folders route
+    // to "Link Instrumental Folder", multi-select is rejected. The host decodes + creates the track.
+    function addMelodyMaker(fileList) {
+      var files = Array.prototype.slice.call(fileList || []).filter(isMedia);
+      if (!files.length) { props.toast && props.toast("Pick a single audio file (WAV/MP3)", h(I.X, null)); return; }
+      if (files.length > 1) { props.toast && props.toast("Melody Maker takes one file — use Link Instrumental Folder for folders", h(I.X, null)); return; }
+      if (!props.onMelodyMaker) return;
+      props.onMelodyMaker(files[0]);
     }
 
     // NOTE: the standalone "Import Audio" picker and sidebar "Record Mic" utility were retired —
@@ -253,6 +265,9 @@
         h("div", { className: "fb-improw" },
           h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, title: "Import a melody/audio file as a continuous Audio Lane clip on the timeline (no step block)", onClick: function () { melodyRef.current && melodyRef.current.click(); } }, h(I.Wave, { width: 15, height: 15 }), "Add Melody File")),
         h("input", { type: "file", ref: melodyRef, accept: "audio/*,video/*", multiple: true, style: { display: "none" }, onChange: function (e) { addMelodies(e.target.files); e.target.value = ""; } }),
+        h("div", { className: "fb-improw" },
+          h("button", { className: "link-btn", style: { margin: 0, width: "auto", flex: 1 }, title: "Melody Maker: load one audio file (WAV/MP3) as a polyphonic pitch-shifting sampler — play it in key across the Piano Roll", onClick: function () { mmRef.current && mmRef.current.click(); } }, h(I.Note, { width: 15, height: 15 }), "Melody Maker")),
+        h("input", { type: "file", ref: mmRef, accept: "audio/*", style: { display: "none" }, onChange: function (e) { addMelodyMaker(e.target.files); e.target.value = ""; } }),
         h("div", { className: "tree" },
           h("div", { className: "tree-sec" }, "LIBRARY"),
           // Phase 3: render only user-linked folders — the stock Factory Core listing is purged so

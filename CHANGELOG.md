@@ -5,6 +5,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — Phase 5: Melody Maker (Polyphonic Pitch-Shifting Sampler)
+- **New track type `track.kind = 'polySampler'`** — a sample-to-piano-roll melodic
+  voice. Implemented as a *sound-source variant* of the existing synth voice, **not a
+  second engine**: `_synthVoice` gained a single source branch — `opts.buffer` present
+  → `AudioBufferSourceNode` resampled to pitch (`playbackRate = 2^((midi-60)/12)`, root
+  C4/MIDI 60); absent → the existing oscillator. The buffer voice flows through the
+  **same** ADSR gain envelope, the **same** voice-steal pool (`_synthVoices` /
+  `_stealSynth`), the **same** de-click stop + `onended` slot-cleanup, and the **same**
+  id-based mixer-insert routing. The FIFO oldest-first steal comparator was already
+  source-agnostic, so no steal rewrite was needed. Buffer voices return their pool slot
+  on `onended` and on steal (no leak past the 16-voice cap); one-shot to natural end
+  (high notes end sooner = correct resampling).
+- **`addPolySamplerTrack(name, buffer, raw)`** — decodes one file into a tonal lane
+  (`type:"sampler"` for IDB rehydrate reuse, `kind:"polySampler"`, `base:60`, shared
+  `synth` ADSR), persisted to IndexedDB. `_fire` checks `kind:"polySampler"` **first**
+  (before the `type:"sampler"` branch) and routes it through `_synthVoice` with the
+  channel's buffer; `renderMixdown` mirrors the same branch so exports include Melody
+  Maker tracks. `previewNote` auditions polySampler notes through the reserved preview
+  sub-pool (never steals a sustaining playback voice). `classifyChannel → "melodic"`;
+  `kind` + `synth` round-trip serialize/hydrate (schema 4, additive).
+- **`[Melody Maker]` sidebar button** (Files tab, below `[Add Melody File]`) — the single
+  melodic entry point: a single-file picker (`accept="audio/*"`, no multi-select) that
+  decodes the file and creates a polySampler track, landing on the timeline. Multi-select
+  and non-audio are rejected (folders still route to `[Link Instrumental Folder]`). A
+  track is only created once the buffer decodes — never sample-less.
+- **`[Synth]` toolbar button removed** (and its `addSynth` handler, command-palette
+  entry, and AddTrackBar option). The oscillator source stays in the engine but is
+  dormant — no UI instantiates it. Melody Maker is now the melodic workflow.
+- **polySampler double-click** always opens the **Piano Roll** regardless of clip
+  presence (empty lane creates a midi clip + Piano Roll; an existing clip opens the
+  Piano Roll directly, never the Waveform/Clip editor). Other track types unchanged.
+
 ### Added — Synth & Melody Creation Suite (4 phases)
 - **Phase 1 — native polyphonic synth.** New track type `track.kind = 'synth'`
   alongside `'sampler'` / `'audioLane'`. `_synthVoice(ctx,…)` generates Saw /

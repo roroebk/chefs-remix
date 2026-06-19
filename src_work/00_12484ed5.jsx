@@ -403,7 +403,22 @@
     // live polyphony cap with voice-stealing (skip for the offline bounce — no realtime CPU bound).
     // preview auditions cap their OWN reserved pool so they never steal a sustaining playback voice.
     if (ctx === this.ctx) { if (preview) this._stealPrev(); else this._stealSynth(); }
-    var osc = ctx.createOscillator(); osc.type = wave; osc.frequency.setValueAtTime(m2f(midi), t);
+    // SOURCE BRANCH (Phase 5 Melody Maker): one voice engine, two sound sources. opts.buffer present
+    // => polySampler (AudioBufferSourceNode resampled to pitch, playbackRate = 2^((midi-60)/12),
+    // root C4/MIDI60); absent => native oscillator synth (dormant). The buffer node is stored as
+    // `osc` so it flows through the SAME ADSR gain, voice-steal pool, de-click stop, and onended
+    // slot-cleanup below with zero duplicated logic. One-shot to natural end falls out for free:
+    // if the buffer ends before relEnd, onended fires early and returns the slot; high notes (rate>1)
+    // end sooner — correct resampling. Loop only when a region is explicitly tagged.
+    var buf = opts.buffer || null;
+    var osc;
+    if (buf) {
+      osc = ctx.createBufferSource(); osc.buffer = buf;
+      osc.playbackRate.setValueAtTime(Math.pow(2, (midi - 60) / 12), t);
+      if (opts.loop) { osc.loop = true; }
+    } else {
+      osc = ctx.createOscillator(); osc.type = wave; osc.frequency.setValueAtTime(m2f(midi), t);
+    }
     var g = ctx.createGain();
     var t0 = t, atkEnd = t0 + A, decEnd = atkEnd + D;
     var relStart = Math.max(t0 + hold, decEnd);       // ensure the decay segment always completes
@@ -490,6 +505,10 @@
     // one-shots (drums) pass 0 -> full natural decay, unchanged.
     // SCHED: kind:'synth' tracks fire the native polyphonic oscillator synth (Phase 1) instead of
     // a sampler buffer or a fixed factory voice. midi = channel root (base) + the note's semis.
+    // SCHED: kind:'polySampler' (Phase 5 Melody Maker) fires the SAME synth voice as kind:'synth'
+    // but with a buffer source — one decoded sample resampled to each note's pitch. Checked FIRST
+    // (its type is also "sampler" for IDB persistence, so it must short-circuit the sampler branch).
+    if (ch.def.kind === "polySampler") { this._synthVoice(this.ctx, t, dest, (ch.def.base || 0) + (semis || 0), vel, durSec, ch.def.synth, { buffer: this.userBuffers[ch.def.bufferId] }); return; }
     if (ch.def.kind === "synth") { this._synthVoice(this.ctx, t, dest, (ch.def.base || 0) + (semis || 0), vel, durSec, ch.def.synth); return; }
     if (ch.def.type === "sampler") { this._playBuffer(this.ctx, this.userBuffers[ch.def.bufferId], t, dest, semis, vel, ch.def.tonal ? durSec : 0); return; }
     this._voice(this.ctx, this.noise, ch.def.type, t, dest, semis, vel, durSec);
@@ -549,6 +568,32 @@
     // error-isolated so a storage failure never blocks adding the track.
     if (opts.raw) {
       var blob = (opts.raw instanceof Blob) ? opts.raw : new Blob([opts.raw]);
+      idbPut(id, blob)["catch"](function (e) { console.warn("[SampleDB] save failed for " + id + ":", e); });
+    }
+    return def;
+  };
+  // Phase 5 Melody Maker: a polyphonic pitch-shifting sampler track. Like addSampler (one decoded
+  // buffer, IDB-persisted, tonal, root C4/MIDI60) but kind:"polySampler" so _fire routes it through
+  // the shared synth voice's buffer source instead of a one-shot _playBuffer. type:"sampler" is
+  // deliberate so hydrate's _rehydrateSample restores the buffer with no extra plumbing; the synth
+  // ADSR object drives the per-note envelope shared with the (dormant) oscillator synth. A
+  // polySampler is NEVER created without a buffer (the Melody Maker picker decodes a file first).
+  Engine.prototype.addPolySamplerTrack = function (name, audioBuffer, raw) {
+    this.init();
+    var n = 1, id = "mel"; while (this.channels[id]) { id = "mel_" + (++n); }
+    this.userBuffers[id] = audioBuffer;
+    var maxRoute = 0; this.channelDefs.forEach(function (c) { if (c.route > maxRoute) maxRoute = c.route; });
+    var route = Math.min(16, maxRoute + 1);
+    var label = (name || "Melody").replace(/\.[a-z0-9]+$/i, "").slice(0, 22);
+    var def = { id: id, label: label, type: "sampler", kind: "polySampler", color: "#9d4edd", route: route,
+                vol: 0.9, pan: 0, tonal: true, base: 60, bufferId: id, sampleId: id, userAudio: true,
+                synth: { wave: "sawtooth", attack: 0.005, decay: 0.12, sustain: 0.8, release: 0.12 } };
+    this.channelDefs.push(def);
+    this.banks.forEach(function (bk) { bk.steps[id] = freshStepRow(patLen(bk)); });
+    this._wireChannel(def);
+    this.focus = id;
+    if (raw) {
+      var blob = (raw instanceof Blob) ? raw : new Blob([raw]);
       idbPut(id, blob)["catch"](function (e) { console.warn("[SampleDB] save failed for " + id + ":", e); });
     }
     return def;
@@ -729,8 +774,10 @@
   // any other tonal track falls back to the normal short audition.
   Engine.prototype.previewNote = function (chId, semis, vel) {
     this.init(); this.resume(); var ch = this.channels[chId]; if (!ch) return;
-    if (ch.def.kind === "synth") {
-      this._synthVoice(this.ctx, this.ctx.currentTime, this._prevBus(), (ch.def.base || 0) + (semis || 0), vel || 100, 0.2, ch.def.synth, { preview: true });
+    if (ch.def.kind === "synth" || ch.def.kind === "polySampler") {
+      var pOpts = { preview: true };
+      if (ch.def.kind === "polySampler") pOpts.buffer = this.userBuffers[ch.def.bufferId];   // audition the sample, not an oscillator
+      this._synthVoice(this.ctx, this.ctx.currentTime, this._prevBus(), (ch.def.base || 0) + (semis || 0), vel || 100, 0.2, ch.def.synth, pOpts);
       return;
     }
     this.playLiveNote(chId, semis, vel || 100);
@@ -790,6 +837,7 @@
     var PERC = { kick: 1, snare: 1, clap: 1, chat: 1, ohat: 1, anvil: 1, rim: 1, shaker: 1 };
     if (PERC[def.type]) return "percussive";
     if (def.kind === "synth" || def.type === "synth") return "melodic";     // native synth = melodic (Piano Roll target)
+    if (def.kind === "polySampler") return "melodic";                       // Melody Maker = pitched sample, Piano Roll target
     if (def.type === "audio" || def.type === "sampler") return "melodic";   // recorded/loaded sounds read as melodic
     return def.tonal ? "melodic" : "percussive";
   };
@@ -1554,7 +1602,8 @@
       var d = Math.max(ev.lenTicks * self.secPerTick() * 0.95, 0.08);
       // Synth Suite (Phase 1): bounce kind:'synth' tracks through the same ADSR oscillator voice as
       // live playback (offline ctx -> no live-voice tracking / stealing), so the export matches.
-      if (c.def.kind === "synth") self._synthVoice(octx, time, out, ev.pitch, ev.vel, d, c.def.synth);
+      if (c.def.kind === "polySampler") self._synthVoice(octx, time, out, ev.pitch, ev.vel, d, c.def.synth, { buffer: self.userBuffers[c.def.bufferId] });
+      else if (c.def.kind === "synth") self._synthVoice(octx, time, out, ev.pitch, ev.vel, d, c.def.synth);
       else if (c.def.type === "sampler") self._playBuffer(octx, self.userBuffers[c.def.bufferId], time, out, semis, ev.vel);
       else self._voice(octx, nb, c.def.type, time, out, semis, ev.vel, d);
     });
@@ -1714,7 +1763,7 @@
         var def = { id: c.id, label: c.label, type: c.type, kind: c.kind || (c.type === "audio" ? "audioLane" : "sampler"), color: c.color, route: c.route,
                     vol: c.vol, pan: c.pan, tonal: c.tonal, base: c.base, sampleId: c.sampleId,
                     bufferId: c.bufferId || c.id, userAudio: !!c.userAudio, audioLane: c.type === "audio" || !!c.audioLane,
-                    synth: (c.kind === "synth" || c.type === "synth") ? (c.synth || { wave: "sawtooth", attack: 0.005, decay: 0.12, sustain: 0.7, release: 0.08 }) : null };
+                    synth: (c.kind === "synth" || c.type === "synth" || c.kind === "polySampler") ? (c.synth || { wave: "sawtooth", attack: 0.005, decay: 0.12, sustain: 0.7, release: 0.08 }) : null };
         self.channelDefs.push(def);
         self.banks.forEach(function (bk) { if (!bk.steps[c.id]) bk.steps[c.id] = freshStepRow(patLen(bk)); });
         self._wireChannel(def);

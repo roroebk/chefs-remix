@@ -165,7 +165,7 @@
       { type: "kick", label: "Kick (Perc)" }, { type: "snare", label: "Snare (Perc)" },
       { type: "chat", label: "Hat (Perc)" }, { type: "sub", label: "Sub Bass (Mel)" },
       { type: "pluck", label: "Chord Pluck (Mel)" }, { type: "lead", label: "Lead (Mel)" },
-      { type: "vox", label: "Vocal (Mel)" }, { type: "synth", label: "Synth — Polyphonic (Mel)" }
+      { type: "vox", label: "Vocal (Mel)" }
     ];
     var open = useState(false); var isOpen = open[0], setOpen = open[1];
     return h("div", { className: "addtrack-bar" },
@@ -544,10 +544,9 @@
     }
 
     // dynamic lane add / delete (delete purges step+note data and disconnects audio nodes in the engine)
-    function addTrack(type) { var d = (type === "synth") ? E.addSynthTrack() : E.addChannel(type); setFocus(E.focus); E.setFocus(E.focus); if (d.tonal) lastTonal.current = d.id; bump(); toast("Added " + d.label, h(I.Plus, { width: 16, height: 16 })); }
-    // Synth Suite (Phase 1/2): append a native polyphonic synth track and land on the Timeline so
-    // the user can immediately double-click its empty lane to open the Piano Roll and draw notes.
-    function addSynth() { setView("timeline"); var d = E.addSynthTrack(); setFocus(E.focus); E.setFocus(E.focus); lastTonal.current = d.id; bump(); toast("Added " + d.label + " — double-click its lane to draw notes", h(I.Piano, { width: 16, height: 16 })); }
+    function addTrack(type) { var d = E.addChannel(type); setFocus(E.focus); E.setFocus(E.focus); if (d.tonal) lastTonal.current = d.id; bump(); toast("Added " + d.label, h(I.Plus, { width: 16, height: 16 })); }
+    // Phase 5: addSynth() and the [Synth] UI entry points were removed — melodic tracks come from
+    // Melody Maker (polySampler). engine.addSynthTrack / the oscillator voice remain, dormant.
     function deleteTrack(id) { var ch = E.channels[id]; var label = ch ? ch.def.label : "Track"; E.removeChannel(id); if (lastTonal.current === id) lastTonal.current = null; setFocus(E.focus); E.setFocus(E.focus); bump(); toast(label + " removed", h(I.Trash, { width: 16, height: 16 })); }
     // ---- project controls (Phase 1: New / Slots / Export-Import) ----
     var SLOT_IDX = "chefs_project_slots", SLOT_PREFIX = "chefs_slot:";
@@ -592,7 +591,6 @@
       { id: "undo", label: "Undo", hint: "Ctrl+Z", run: doUndo },
       { id: "redo", label: "Redo", hint: "Ctrl+Y", run: doRedo },
       { id: "add", label: "Add Track", run: function () { addTrack("kick"); } },
-      { id: "add-synth", label: "Add Synth Track (Polyphonic)", run: addSynth },
       { id: "new", label: "New Clean Project", run: newProject },
       { id: "export", label: "Export… (Mixdown / Stems)", run: function () { setShowEx(true); } },
       { id: "save", label: "Export Project (.json)", run: exportProject },
@@ -624,11 +622,24 @@
                   toast("Added melody: " + f.name + " (" + ok + "/" + total + ")", h(I.Wave, { width: 16, height: 16 }));
                 }, function () { toast("Could not decode " + f.name, h(I.X, { width: 16, height: 16 })); });
               });
+            },
+            onMelodyMaker: function (f) {
+              // Phase 5 Melody Maker: decode one file -> a polyphonic pitch-shifting sampler
+              // (polySampler) track, then land on the timeline so its lane can be double-clicked to
+              // open the Piano Roll and play the sample in key. A track is only created once the
+              // buffer decodes (no sample-less polySampler).
+              E.decodeAudioFile(f, function (buf) {
+                var d = E.addPolySamplerTrack(f.name, buf, f);
+                setView("timeline"); setFocus(E.focus); E.setFocus(E.focus); lastTonal.current = d.id; bump();
+                toast("Melody Maker: " + d.label + " — double-click its lane to draw notes", h(I.Note, { width: 16, height: 16 }));
+              }, function () { toast("Could not decode " + f.name, h(I.X, { width: 16, height: 16 })); });
             } }),
           h("div", { className: "stage-main" },
             h("div", { className: "tabs" },
               TABS.map(function (tb) { return h("button", { key: tb.id, className: "tab" + (view === tb.id ? " on" : ""), onClick: function () { setView(tb.id); setEditClip(null); } }, h("span", { className: "ti" }, h(tb.ic, { width: 16, height: 16 })), tb.label); }),
-              h("button", { className: "hdr-btn", title: "Add a native polyphonic Synth track — then double-click its timeline lane to draw notes in the Piano Roll", onClick: addSynth }, [h(I.Piano, { width: 14, height: 14, key: "i" }), " Synth"]),
+              // Phase 5: the standalone [Synth] toolbar button was removed — Melody Maker (sidebar) is
+              // the single melodic entry point. The oscillator source stays in the engine, dormant
+              // (no UI instantiates it). Intended, not an oversight.
               h(ProjectMenu, { onNew: newProject, onExport: exportProject, onImportFile: importProjectFile, onSaveSlot: saveSlot, onLoadSlot: loadSlot, onDeleteSlot: deleteSlot, slots: slots, onOpen: refreshSlots }),
               h("button", { className: "hdr-btn", title: "Undo (Ctrl+Z)", onClick: doUndo }, "↶"),
               h("button", { className: "hdr-btn", title: "Redo (Ctrl+Y)", onClick: doRedo }, "↷"),

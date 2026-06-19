@@ -296,7 +296,9 @@
         onWheel: isAudio ? function (e) { onClipWheel(e, c); } : null,
         // Phase 10: an audio clip double-click opens the non-destructive Waveform Editor; a midi
         // clip opens the Clip Editor (Steps/Notes/FX) as before.
-        onDoubleClick: function (e) { e.stopPropagation(); if (isAudio && props.onOpenWave) { props.onOpenWave(c); return; } (props.onEditClip || props.onOpenClipFx) && (props.onEditClip ? props.onEditClip(c) : props.onOpenClipFx(c)); },
+        // Phase 5: a polySampler clip ALWAYS opens the Piano Roll regardless of clip presence —
+        // clip-presence never routes a Melody Maker track to the Waveform/Clip editor.
+        onDoubleClick: function (e) { e.stopPropagation(); var chDef = window.engine.channels[c.ch] && window.engine.channels[c.ch].def; if (chDef && chDef.kind === "polySampler" && props.onOpenClip) { props.onOpenClip(c); return; } if (isAudio && props.onOpenWave) { props.onOpenWave(c); return; } (props.onEditClip || props.onOpenClipFx) && (props.onEditClip ? props.onEditClip(c) : props.onOpenClipFx(c)); },
         title: lane.label + (isAudio ? " audio take · scroll = gain · drag top corners = fade in/out · dbl-click → Waveform Editor" : " clip · dbl-click → Clip Editor (Steps/Notes/FX) · ✎ edit notes") + " · drag right edge to chop/trim" },
         h("span", { className: "tl-clip-lbl" }, (isAudio ? (c.name || "Take") : lane.label) + (isAudio && gainPct !== 100 ? "  " + gainPct + "%" : "")),
         (isAudio && (c.fadeInTicks || 0) > 0 ? h("div", { className: "tl-fade-ramp in", style: { width: Math.max(2, t2x(c.fadeInTicks)) } }) : null),
