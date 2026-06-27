@@ -18,8 +18,19 @@
 
     // ---- Adaptive snapping (no manual snap buttons): the grid divisions subdivide automatically
     // as you zoom in — 1/4 -> 1/8 -> 1/16 -> 1/32. Units below are 1/16-steps (16 = one bar). ----
-    function snapStep() { return zoom >= 64 ? 0.5 : zoom >= 32 ? 1 : zoom >= 16 ? 2 : 4; }
-    function snapLabel() { var s = snapStep(); return s === 0.5 ? "1/32" : s === 1 ? "1/16" : s === 2 ? "1/8" : "1/4"; }
+    // Phase 3: when props.triplet is on, the grid switches to triplet divisions ALONGSIDE the duple
+    // ones. Standard triplet spacing in 1/16-step units: 1/8T = 1.333 step (PPQ/3), 1/16T = 0.667
+    // step (PPQ/6) — matching the Timeline grid. Existing notes keep their absolute positions; only
+    // new placement/resize snaps to the division.
+    var trip = !!props.triplet;
+    function snapStep() {
+      if (trip) return zoom >= 32 ? (2 / 3) : (4 / 3);   // 1/16T : 1/8T
+      return zoom >= 64 ? 0.5 : zoom >= 32 ? 1 : zoom >= 16 ? 2 : 4;
+    }
+    function snapLabel() {
+      if (trip) return zoom >= 32 ? "1/16T" : "1/8T";
+      var s = snapStep(); return s === 0.5 ? "1/32" : s === 1 ? "1/16" : s === 2 ? "1/8" : "1/4";
+    }
     function snapV(x) { var s = snapStep(); return Math.max(0, Math.round(x / s) * s); }
     // T5 fix: the stage is under a CSS scale() transform, so getBoundingClientRect is in scaled
     // viewport px. xToStep divides by colW (also scaled) so scale cancels — but yToPitch divided a
@@ -56,15 +67,45 @@
       window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
     }
 
-    // gridlines at the active (zoom-derived) division, with beat/bar emphasis
+    // ---- Audition (this batch): play/loop/solo the edited region (or a ruler-dragged loop region)
+    // in isolation. All controls bind to the host's shared scoped-transport handle (props.audition);
+    // there is NO second engine. Default range = the whole edited region; a ruler region overrides it.
+    var au = props.audition || null;
+    var lrState = useState(null); var loopRegion = lrState[0], setLoopRegion = lrState[1];   // {a,b} in 1/16 steps
+    function pushRange(reg) {
+      if (!au) return;
+      if (reg) au.setRange(Math.min(reg.a, reg.b), Math.max(reg.a, reg.b));
+      else au.setRange(0, STEPS);   // default = the bar/clip under edit
+    }
+    function onRulerDown(e) {
+      if (!au) return; e.preventDefault(); e.stopPropagation();
+      var a = snapV(xToStep(e.clientX)), moved = false;
+      function mv(ev) { var b = snapV(xToStep(ev.clientX)); if (Math.abs(b - a) >= snapStep()) { moved = true; setLoopRegion({ a: a, b: b }); } }
+      function up(ev) {
+        window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up);
+        if (!moved) { setLoopRegion(null); pushRange(null); }   // click (no drag) clears the region
+        else { var b = snapV(xToStep(ev.clientX)); var reg = { a: Math.min(a, b), b: Math.max(a, b) }; if (reg.b <= reg.a) reg.b = reg.a + snapStep(); setLoopRegion(reg); pushRange(reg); }
+      }
+      window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+    }
+    function toggleAudition() { if (!au) return; if (au.active) au.stop(); else { pushRange(loopRegion); au.play(); } }
+
+    // gridlines at the active (zoom-derived) division, with beat/bar emphasis (float-tolerant for triplets)
     var step = snapStep(); var glines = [];
-    for (var st = 0; st <= STEPS; st += step) { glines.push({ x: st / STEPS, cls: st % 16 === 0 ? "bar" : (st % 4 === 0 ? "beat" : "sub") }); }
+    for (var st = 0; st <= STEPS + 1e-6; st += step) {
+      var nearBar = Math.abs(st / 16 - Math.round(st / 16)) < 1e-6, nearBeat = Math.abs(st / 4 - Math.round(st / 4)) < 1e-6;
+      glines.push({ x: Math.min(1, st / STEPS), cls: nearBar ? "bar" : nearBeat ? "beat" : "sub" });
+    }
 
     return h("div", { className: "pl" },
       h("div", { className: "pl-toolbar" },
         h("span", { className: "sub", style: { fontWeight: 700, color: "var(--text-hi)" } }, "PIANO ROLL"),
         h("span", { className: "badge", style: { background: "color-mix(in srgb," + ch.color + " 18%, var(--surface-3))", color: ch.color } }, ch.label),
         h("span", { className: "tl-snapchip", title: "Adaptive grid — subdivides automatically as you zoom in" }, "GRID ", h("b", null, snapLabel())),
+        au ? h("span", { className: "pr-audition", title: "Audition this region in isolation (drag the ruler to set a loop region)" },
+          h("button", { className: "pr-aud play" + (au.active ? " on" : ""), title: au.active ? "Stop audition" : "Play audition", onClick: toggleAudition }, au.active ? "■" : "▶"),
+          h("button", { className: "pr-aud" + (au.loop ? " on" : ""), title: "Loop the audition range", onClick: function () { au.setLoop(!au.loop); } }, "⟳"),
+          h("button", { className: "pr-aud" + (au.solo ? " on" : ""), title: "Solo this track while auditioning", onClick: function () { au.setSolo(!au.solo); } }, "S")) : null,
         props.onSetLength ? h("span", { className: "pr-lenpick", title: "Pattern length in bars" },
           h("span", { className: "lbl" }, "LENGTH"),
           [1, 2, 4, 8, 16, 32].map(function (b) {
@@ -85,6 +126,8 @@
           h("div", { ref: trackRef, className: "pr-grid", style: { position: "relative", width: gridW, flex: "none", height: totalH, cursor: "crosshair" }, onMouseDown: onTrackDown, onContextMenu: function (e) { e.preventDefault(); } },
             rows.map(function (p, i) { var pc = p % 12; return h("div", { key: "l" + p, className: "pr-lane" + (BLACK[pc] ? " black" : "") + (pc === 0 ? " croot" : ""), style: { top: i * LANE, height: LANE } }); }),
             glines.map(function (g, i) { return h("div", { key: "g" + i, className: "pr-gl " + g.cls, style: { left: (g.x * 100) + "%" } }); }),
+            (au && loopRegion) ? h("div", { className: "pr-loopreg", style: { left: (Math.min(loopRegion.a, loopRegion.b) / STEPS * 100) + "%", width: (Math.abs(loopRegion.b - loopRegion.a) / STEPS * 100) + "%" } }) : null,
+            au ? h("div", { className: "pr-ruler", onMouseDown: onRulerDown, title: "Drag to set an audition loop region · click to clear" }) : null,
             props.playStep >= 0 ? h("div", { className: "pl-playhead", style: { left: (props.playStep / STEPS * 100) + "%" } }) : null,
             notes.map(function (n) {
               var top = (hi - n.pitch) * LANE; var left = n.start / STEPS * 100; var w = n.len / STEPS * 100;

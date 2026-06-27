@@ -146,6 +146,31 @@
     // Phase 4: last sounded (tick,time) schedule point — the playhead UI interpolates off the
     // audio clock from here for sample-accurate 1:1 motion (not the 1/16 step grid).
     this._phPoint = null;
+    // ---- Audition: scoped-range transport (this batch) ------------------------
+    // ONE transport, ONE voice engine. Auditioning a Piano-Roll bar or a sample waveform reuses the
+    // SAME look-ahead scheduler + voice pools, just bounded to a half-open tick window
+    // [_scopeStart,_scopeEnd). Entering snapshots the global transport (playhead + play state) and
+    // pauses it; exiting restores it exactly so an audition never loses the producer's place.
+    // _scopeOwner ('piano'|'wave') makes the Phase-5 tab handoff an explicit ownership transfer.
+    this._scopeActive = false; this._scopeStart = 0; this._scopeEnd = 0;
+    this._scopeLoop = true; this._scopeSoloId = null; this._scopeOwner = null; this._scopeSnap = null;
+    // single shared handle both the Piano Roll and Waveform tab bind to (never two instances)
+    var self = this;
+    this.scope = {
+      enter: function (o) { return self.enterScope(o); },
+      play: function () { return self.playScope(); },
+      pause: function () { return self.pauseScope(); },
+      exit: function () { return self.exitScope(); },
+      stopScopeVoices: function () { return self.stopScopeVoices(); },
+      setRange: function (s, e) { return self.setScopeRange(s, e); },
+      setLoop: function (on) { return self.setScopeLoop(on); },
+      setSolo: function (chId) { return self.setScopeSolo(chId); },
+      scrub: function (tick) { return self.seek(tick); },
+      isActive: function () { return self._scopeActive; },
+      isPlaying: function () { return self._scopeActive && self.isPlaying; },
+      owner: function () { return self._scopeOwner; },
+      setOwner: function (o) { self._scopeOwner = o || null; }
+    };
   }
 
   // ---- audio graph ----------------------------------------------------------
@@ -1126,15 +1151,34 @@
     this._fire(ev.ch, time, semis, ev.vel, Math.max(ev.lenTicks * this.secPerTick() * 0.95, 0.08), send);
   };
   Engine.prototype._scheduleTimeline = function () {
-    var spt = this.secPerTick(), loop = this.timeline.loop, evs = this._tlEvents || [];
+    var spt = this.secPerTick(), evs = this._tlEvents || [];
+    // Scoped audition (this batch) reuses this exact loop, only the boundaries differ: the window
+    // is [startB, endB) and looping/solo come from the scope, not timeline.loop.
+    var scoped = this._scopeActive;
+    var loopOn = scoped ? this._scopeLoop : this.timeline.loop.on;
+    var startB = scoped ? this._scopeStart : (this.timeline.loop.on ? this.timeline.loop.startTick : 0);
+    var endB = scoped ? this._scopeEnd : (this.timeline.loop.on ? this.timeline.loop.endTick : this.timeline.lengthTicks);
     while (this.nextStepTime < this.ctx.currentTime + this.scheduleAhead) {
       var tick = this.playheadTick, time = this.nextStepTime, cur = this._tlCursor;
-      while (cur < evs.length && evs[cur].absTick === tick) { this._fireEvent(evs[cur], time); cur++; }
-      this._tlCursor = cur;
-      if (tick % TICKS_PER_STEP === 0) { this.notesInQueue.push({ time: time, step: tick, bar: -1, tl: true }); this._applyAutomation(tick, time); } // playhead UI + automation (1/16 granularity)
+      // Fix 3: STRICT half-open interval — fire only when startB <= tick < endB. Never fire AT endB,
+      // so the boundary note can't double-trigger on the wrap (and the loop seam stays sample-clean).
+      // The lower bound is enforced only in scoped mode; global playback keeps its original behavior.
+      if (tick < endB && (!scoped || tick >= startB)) {
+        while (cur < evs.length && evs[cur].absTick === tick) {
+          var ev = evs[cur];
+          // track-solo audition: in scoped mode with a soloId, only that channel sounds
+          if (!(scoped && this._scopeSoloId && ev.ch !== this._scopeSoloId)) this._fireEvent(ev, time);
+          cur++;
+        }
+        this._tlCursor = cur;
+        if (tick % TICKS_PER_STEP === 0) { this.notesInQueue.push({ time: time, step: tick, bar: -1, tl: true }); this._applyAutomation(tick, time); } // playhead UI + automation (1/16 granularity)
+      }
       this.playheadTick++; this.nextStepTime += spt;
-      if (loop.on && this.playheadTick >= loop.endTick) { this.playheadTick = loop.startTick; this._tlCursor = this._cursorForTick(loop.startTick); }
-      else if (!loop.on && this.playheadTick >= this.timeline.lengthTicks) { this.pause(); break; }
+      if (this.playheadTick >= endB) {
+        if (loopOn) { this.playheadTick = startB; this._tlCursor = this._cursorForTick(startB); }
+        else if (scoped) { this.pauseScope(); this.playheadTick = startB; if (this.onPlayhead) this.onPlayhead(startB); break; }
+        else { this.pause(); break; }
+      }
     }
   };
 
@@ -1190,6 +1234,77 @@
   Engine.prototype.pause = function () { this.isPlaying = false; if (this.timer) { clearInterval(this.timer); this.timer = null; } this._killLaneVoices(); this._killSynthVoices(); };   // Phase 8: silence ringing lane + synth voices with a de-click ramp
   Engine.prototype.stop = function () { this._finalizePerf(); this._resetParams(); this.pause(); this.stepIndex = 0; this.songStep = 0; this.playheadTick = 0; this._lastStep = -1; this._phPoint = null; if (this.onStep) this.onStep(-1, -1); if (this.onPlayhead) this.onPlayhead(-1); };
   Engine.prototype.setMode = function (mode) { if (this.playMode === mode) return; this.playMode = mode; if (this.isPlaying) { this.pause(); this.start(mode); } };
+
+  // ---- Audition: scoped-range transport lifecycle (this batch) ---------------
+  // enterScope snapshots the global transport, pauses it, and arms a half-open [start,end) window.
+  // The same _scheduler/_scheduleTimeline + _fire/_synthVoice voice layer drives it — no 2nd engine.
+  Engine.prototype.enterScope = function (opts) {
+    this.init(); this.resume(); opts = opts || {};
+    // snapshot the producer's place BEFORE pausing so exitScope can restore it exactly
+    this._scopeSnap = { playheadTick: this.playheadTick, isPlaying: this.isPlaying, playMode: this.playMode };
+    this.pause();                                  // de-clicks global voices; scope + global never sound together
+    this.playMode = "timeline";
+    var s = Math.max(0, Math.round(opts.startTick || 0));
+    var e = Math.round(opts.endTick != null ? opts.endTick : s + TICKS_PER_BAR);
+    if (e <= s) e = s + TICKS_PER_BAR;
+    this._scopeStart = s; this._scopeEnd = e;
+    this._scopeLoop = opts.loop !== false;         // audition loops by default
+    this._scopeSoloId = opts.soloId || null;
+    this._scopeOwner = opts.owner || null;
+    this._scopeActive = true;
+    this.syncAllRackClips();                        // hear rack/pattern content in the window too
+    this._tlEvents = this.timelineEvents();
+    this.playheadTick = s; this._tlCursor = this._cursorForTick(s);
+    if (this.onPlayhead) this.onPlayhead(s);
+  };
+  // play/pause the scoped window (drives the same setInterval scheduler as the global transport)
+  Engine.prototype.playScope = function () {
+    if (!this._scopeActive) return; this.init(); this.resume(); if (this.isPlaying) return;
+    this.isPlaying = true; this.notesInQueue = [];
+    this.playheadTick = this._scopeStart; this._tlEvents = this.timelineEvents();
+    this._tlCursor = this._cursorForTick(this._scopeStart);
+    this.nextStepTime = this.ctx.currentTime + 0.06;
+    this._phPoint = { tick: this.playheadTick, time: this.nextStepTime };
+    var self = this; this.timer = setInterval(function () { self._scheduler(); }, this.lookahead); this._draw();
+  };
+  Engine.prototype.pauseScope = function () {
+    this.isPlaying = false; if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    this.stopScopeVoices();
+  };
+  // live window/loop/solo updates while scoped — read by _scheduleTimeline within ~one lookahead tick.
+  Engine.prototype.setScopeRange = function (startTick, endTick) {
+    this._scopeStart = Math.max(0, Math.round(startTick || 0));
+    this._scopeEnd = Math.max(this._scopeStart + 1, Math.round(endTick || (this._scopeStart + TICKS_PER_BAR)));
+    if (this._scopeActive) {
+      this.playheadTick = this._scopeStart; this._tlCursor = this._cursorForTick(this._scopeStart);
+      if (this.isPlaying) { this.nextStepTime = this.ctx.currentTime + 0.03; this.notesInQueue = []; this._phPoint = { tick: this._scopeStart, time: this.nextStepTime }; }
+    }
+  };
+  Engine.prototype.setScopeLoop = function (on) { this._scopeLoop = !!on; };
+  Engine.prototype.setScopeSolo = function (chId) { this._scopeSoloId = chId || null; };
+  // synchronous de-click + stop of every scoped voice — reuses the existing 8ms ramps. Called by
+  // exitScope AND by the Phase-5 tab handoff (window.engine.scope.stopScopeVoices()) so a Piano-Roll
+  // loop can never survive under a Waveform scrub (zombie buffer).
+  Engine.prototype.stopScopeVoices = function () { this._killLaneVoices(); this._killSynthVoices(); };
+  // leave scoped mode and restore the global transport EXACTLY (playhead + play state).
+  Engine.prototype.exitScope = function () {
+    if (!this._scopeActive && !this._scopeSnap) return;
+    this.pauseScope();
+    this._scopeActive = false; this._scopeOwner = null; this._scopeSoloId = null;
+    var snap = this._scopeSnap; this._scopeSnap = null;
+    if (!snap) return;
+    this.playMode = snap.playMode; this.playheadTick = snap.playheadTick;
+    if (this.playMode === "timeline") { this._tlEvents = this.timelineEvents(); this._tlCursor = this._cursorForTick(this.playheadTick); }
+    if (snap.isPlaying) {
+      // resume global playback at the restored tick (start() would reset the playhead to 0/loop-start)
+      this.init(); this.resume(); this.isPlaying = true; this.notesInQueue = [];
+      this.syncAllRackClips(); this.recomputeTimelineLength();
+      this._tlEvents = this.timelineEvents(); this._tlCursor = this._cursorForTick(this.playheadTick);
+      this.nextStepTime = this.ctx.currentTime + 0.06;
+      this._phPoint = { tick: this.playheadTick, time: this.nextStepTime };
+      var self = this; this.timer = setInterval(function () { self._scheduler(); }, this.lookahead); this._draw();
+    } else if (this.onPlayhead) this.onPlayhead(this.playheadTick);
+  };
   Engine.prototype._draw = function () {
     var self = this; if (!this.isPlaying) return; var now = this.ctx.currentTime, cur = null;
     while (this.notesInQueue.length && this.notesInQueue[0].time <= now) { cur = this.notesInQueue.shift(); }

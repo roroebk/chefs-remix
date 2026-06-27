@@ -306,11 +306,16 @@
   // clip object referencing the same buffer with adjusted in/out points (engine.splitClipAt).
   function WaveEditor(props) {
     var clip = props.clip, cref = useRef(null);
+    var readOnly = !!props.readOnly, embedded = !!props.embedded, au = props.audition || null;
     var rs = useState(0); var bump = function () { rs[1](function (x) { return x + 1; }); props.commit && props.commit(); };
-    var buf = E.userBuffers[clip.bufferId];
+    // Phase 4 Fix 1: a polySampler clip has no own bufferId — the Waveform tab shows the channel's
+    // SOURCE sample (props.srcBufferId) READ-ONLY (no split/slice/fade/gain). Audio-Lane clips edit
+    // their own windowed buffer exactly as before.
+    var srcMode = (clip.bufferId == null && props.srcBufferId != null);
+    var buf = E.userBuffers[srcMode ? props.srcBufferId : clip.bufferId];
     var bufDur = buf ? buf.duration : 0;
-    var offsetSec = E.tickToSec(clip.offsetTicks || 0);
-    var clipDurSec = clip.trimmed ? E.tickToSec(clip.lengthTicks) : Math.max(0, bufDur - offsetSec);
+    var offsetSec = srcMode ? 0 : E.tickToSec(clip.offsetTicks || 0);
+    var clipDurSec = srcMode ? bufDur : (clip.trimmed ? E.tickToSec(clip.lengthTicks) : Math.max(0, bufDur - offsetSec));
     var sp = useState(0.5); var splitPos = sp[0], setSplitPos = sp[1];   // 0..1 within the clip window
     function gain() { return clip.gain != null ? clip.gain : 1; }
     function fadeFrac(t) { return clipDurSec > 0 ? Math.max(0, Math.min(0.5, E.tickToSec(t || 0) / clipDurSec)) : 0; }
@@ -319,7 +324,7 @@
       var r = cv.getBoundingClientRect(), Wd = cv.width = Math.max(8, Math.floor(r.width * 2)), Hd = cv.height = Math.max(8, Math.floor(r.height * 2));
       ctx.clearRect(0, 0, Wd, Hd);
       ctx.fillStyle = "rgba(157,78,221,0.06)"; ctx.fillRect(0, 0, Wd, Hd);
-      var peaks = (clip.peaks && clip.peaks.length) ? clip.peaks : (buf ? E.computePeaks(buf, 600) : []);
+      var peaks = (!srcMode && clip.peaks && clip.peaks.length) ? clip.peaks : (buf ? E.computePeaks(buf, 600) : []);
       var n = peaks.length, mid = Hd / 2, g = gain();
       if (n && bufDur > 0) {
         // only the windowed slice [offset, offset+dur] of the buffer is what this clip plays
@@ -335,24 +340,48 @@
         ctx.stroke();
       }
       ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(Wd, mid); ctx.stroke();
-      // fade wedges
-      var fi = fadeFrac(clip.fadeInTicks) * Wd, fo = fadeFrac(clip.fadeOutTicks) * Wd;
-      ctx.fillStyle = "rgba(0,0,0,0.45)";
-      if (fi > 0) { ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(fi, 0); ctx.lineTo(0, Hd); ctx.closePath(); ctx.fill(); }
-      if (fo > 0) { ctx.beginPath(); ctx.moveTo(Wd, 0); ctx.lineTo(Wd - fo, 0); ctx.lineTo(Wd, Hd); ctx.closePath(); ctx.fill(); }
-      // split marker
-      var sx = splitPos * Wd; ctx.strokeStyle = "#ffb338"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, Hd); ctx.stroke();
-    }, [rs[0], clip.id, clip.gain, clip.fadeInTicks, clip.fadeOutTicks, clip.lengthTicks, clip.offsetTicks, splitPos]);
-    function setGain(v) { clip.gain = v; bump(); }
-    function setFadeIn(frac) { clip.fadeInTicks = Math.round(E.secToTick(frac * clipDurSec)); bump(); }
-    function setFadeOut(frac) { clip.fadeOutTicks = Math.round(E.secToTick(frac * clipDurSec)); bump(); }
+      if (!readOnly) {
+        // fade wedges
+        var fi = fadeFrac(clip.fadeInTicks) * Wd, fo = fadeFrac(clip.fadeOutTicks) * Wd;
+        ctx.fillStyle = "rgba(0,0,0,0.45)";
+        if (fi > 0) { ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(fi, 0); ctx.lineTo(0, Hd); ctx.closePath(); ctx.fill(); }
+        if (fo > 0) { ctx.beginPath(); ctx.moveTo(Wd, 0); ctx.lineTo(Wd - fo, 0); ctx.lineTo(Wd, Hd); ctx.closePath(); ctx.fill(); }
+        // split marker
+        var sx = splitPos * Wd; ctx.strokeStyle = "#ffb338"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, Hd); ctx.stroke();
+      }
+      // Phase 5: audition playhead — green line projected at the scoped-transport position within the window
+      if (props.playFrac != null && props.playFrac >= 0 && props.playFrac <= 1) {
+        var px = props.playFrac * Wd; ctx.strokeStyle = "#39d98a"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, Hd); ctx.stroke();
+      }
+    }, [rs[0], clip.id, clip.gain, clip.fadeInTicks, clip.fadeOutTicks, clip.lengthTicks, clip.offsetTicks, splitPos, readOnly, srcMode, props.playFrac]);
+    function setGain(v) { if (readOnly) return; clip.gain = v; bump(); }
+    function setFadeIn(frac) { if (readOnly) return; clip.fadeInTicks = Math.round(E.secToTick(frac * clipDurSec)); bump(); }
+    function setFadeOut(frac) { if (readOnly) return; clip.fadeOutTicks = Math.round(E.secToTick(frac * clipDurSec)); bump(); }
     function doSplit() {
+      if (readOnly) return;
       var absTick = clip.startTick + Math.round(splitPos * clip.lengthTicks);
       var rid = E.splitClipAt(clip.id, absTick);
-      if (rid) { props.commit && props.commit(); props.toast && props.toast("Clip split into 2"); props.onClose(); }
+      if (rid) { props.commit && props.commit(); props.toast && props.toast("Clip split into 2"); if (!embedded) props.onClose(); }
       else { props.toast && props.toast("Split point must be inside the clip"); }
     }
-    function reset() { clip.gain = 1; clip.fadeInTicks = 0; clip.fadeOutTicks = 0; bump(); }
+    function reset() { if (readOnly) return; clip.gain = 1; clip.fadeInTicks = 0; clip.fadeOutTicks = 0; bump(); }
+    function onCanvasScrub(e) { if (!au) return; var r = e.currentTarget.getBoundingClientRect(); au.scrub(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width))); }
+    var auBar = au ? h("div", { className: "wave-audbar" },
+      h("button", { className: "pr-aud play" + (au.active ? " on" : ""), title: au.active ? "Stop audition" : "Play audition", onClick: function () { au.active ? au.stop() : au.play(); } }, au.active ? "■" : "▶"),
+      h("button", { className: "pr-aud" + (au.loop ? " on" : ""), title: "Loop the audition", onClick: function () { au.setLoop(!au.loop); } }, "⟳"),
+      h("span", { className: "sub", style: { marginLeft: 8 } }, readOnly ? "Read-only · Melody Maker source sample · click the wave to scrub" : "Click the waveform to scrub")) : null;
+    var canvas = buf ? h("canvas", { ref: cref, className: "wave-canvas", style: { width: "100%", height: 200, cursor: au ? "text" : "default" }, onClick: onCanvasScrub })
+                     : h(EmptyPane, { title: "Audio still loading", sub: "The clip's buffer is being restored — reopen in a moment." });
+    var ctrls = h("div", { className: "wave-ctrls" },
+      h("div", { className: "wave-ctl" }, h("label", null, "Clip Gain"), h("input", { type: "range", min: 0, max: 2, step: 0.01, value: gain(), disabled: readOnly, onChange: function (e) { setGain(parseFloat(e.target.value)); } }), h("span", { className: "mono" }, Math.round(gain() * 100) + "%")),
+      h("div", { className: "wave-ctl" }, h("label", null, "Fade In"), h("input", { type: "range", min: 0, max: 0.5, step: 0.01, value: fadeFrac(clip.fadeInTicks), disabled: readOnly, onChange: function (e) { setFadeIn(parseFloat(e.target.value)); } }), h("span", { className: "mono" }, Math.round(E.tickToSec(clip.fadeInTicks || 0) * 1000) + "ms")),
+      h("div", { className: "wave-ctl" }, h("label", null, "Fade Out"), h("input", { type: "range", min: 0, max: 0.5, step: 0.01, value: fadeFrac(clip.fadeOutTicks), disabled: readOnly, onChange: function (e) { setFadeOut(parseFloat(e.target.value)); } }), h("span", { className: "mono" }, Math.round(E.tickToSec(clip.fadeOutTicks || 0) * 1000) + "ms")),
+      h("div", { className: "wave-ctl" }, h("label", null, "Split At"), h("input", { type: "range", min: 0, max: 1, step: 0.001, value: splitPos, disabled: readOnly, onChange: function (e) { setSplitPos(parseFloat(e.target.value)); } }), h("button", { className: "btn", disabled: readOnly, onClick: doSplit }, "✂ Split")));
+    if (embedded) {
+      // re-hosted INSIDE the dual-tab panel's Waveform tab (no overlay/modal chrome of its own)
+      return h("div", { className: "wave-embed" }, auBar, canvas, readOnly ? null : ctrls,
+        h("p", { className: "sub", style: { marginTop: 4 } }, readOnly ? "Melody Maker source — pitched playback is edited in the Piano Roll tab; this view is read-only." : "Non-destructive — edits change clip metadata only; the source audio is never modified."));
+    }
     return h("div", { className: "overlay", onClick: function (e) { if (e.target === e.currentTarget) props.onClose(); } },
       h("div", { className: "modal wave-editor", style: { width: 760, maxWidth: "94vw" } },
         h("div", { className: "modal-head" },
@@ -360,18 +389,72 @@
           h("h3", null, "Waveform Editor · ", clip.name || "Audio Clip",
             h("span", { className: "sub", style: { marginLeft: 8 } }, clipDurSec.toFixed(2) + "s" + (clip.trimmed ? " · trimmed" : " · full"))),
           h("button", { className: "tbtn", style: { marginLeft: "auto", width: 32, height: 32 }, onClick: props.onClose }, h(I.X, { width: 16, height: 16 }))),
-        h("div", { className: "modal-body" },
-          buf ? h("canvas", { ref: cref, className: "wave-canvas", style: { width: "100%", height: 200 } })
-              : h(EmptyPane, { title: "Audio still loading", sub: "The clip's buffer is being restored — reopen in a moment." }),
-          h("div", { className: "wave-ctrls" },
-            h("div", { className: "wave-ctl" }, h("label", null, "Clip Gain"), h("input", { type: "range", min: 0, max: 2, step: 0.01, value: gain(), onChange: function (e) { setGain(parseFloat(e.target.value)); } }), h("span", { className: "mono" }, Math.round(gain() * 100) + "%")),
-            h("div", { className: "wave-ctl" }, h("label", null, "Fade In"), h("input", { type: "range", min: 0, max: 0.5, step: 0.01, value: fadeFrac(clip.fadeInTicks), onChange: function (e) { setFadeIn(parseFloat(e.target.value)); } }), h("span", { className: "mono" }, Math.round(E.tickToSec(clip.fadeInTicks || 0) * 1000) + "ms")),
-            h("div", { className: "wave-ctl" }, h("label", null, "Fade Out"), h("input", { type: "range", min: 0, max: 0.5, step: 0.01, value: fadeFrac(clip.fadeOutTicks), onChange: function (e) { setFadeOut(parseFloat(e.target.value)); } }), h("span", { className: "mono" }, Math.round(E.tickToSec(clip.fadeOutTicks || 0) * 1000) + "ms")),
-            h("div", { className: "wave-ctl" }, h("label", null, "Split At"), h("input", { type: "range", min: 0, max: 1, step: 0.001, value: splitPos, onChange: function (e) { setSplitPos(parseFloat(e.target.value)); } }), h("button", { className: "btn", onClick: doSplit }, "✂ Split"))),
+        h("div", { className: "modal-body" }, canvas, ctrls,
           h("p", { className: "sub", style: { marginTop: 4 } }, "Non-destructive — edits change clip metadata only; the source audio is never modified.")),
         h("div", { className: "modal-foot" },
           h("button", { className: "btn", onClick: reset }, "Reset"),
           h("button", { className: "btn primary", onClick: props.onClose }, "Done"))));
+  }
+
+  // ---------- Dual-tab editor panel (this batch) ----------
+  // ONE container hosting a Piano Roll tab + a Waveform tab. Routing: MIDI/synth → Piano Roll only;
+  // audio → Waveform only; polySampler → Piano-Roll-focused with a clickable Waveform tab (the source
+  // sample, read-only). Both tabs audition through the SAME shared scoped-transport handle (E.scope):
+  // entering the panel snapshots+pauses the global transport, exiting restores the producer's place.
+  function DualEditor(props) {
+    var clip = props.clip, chDef = props.chDef || {}, api = props.api;
+    var TPS = E.TICKS_PER_STEP;
+    var isAudio = clip.kind === "audio";
+    var isPoly = !isAudio && chDef.kind === "polySampler";
+    var bars = Math.max(1, Math.ceil((clip.lengthTicks || TPS * 16) / TPS / 16)), steps = bars * 16;
+    var tabs = isAudio ? [{ id: "wave", l: "Waveform" }]
+             : isPoly ? [{ id: "piano", l: "Piano Roll" }, { id: "wave", l: "Waveform" }]
+             : [{ id: "piano", l: "Piano Roll" }];
+    var tab = tabs.some(function (t) { return t.id === props.tab; }) ? props.tab : tabs[0].id;
+    var rs = useState(0); var bump = function () { rs[1](function (x) { return x + 1; }); props.commit && props.commit(); };
+    var auS = useState(false); var auditioning = auS[0], setAuditioning = auS[1];
+    var loopS = useState(true); var loopOn = loopS[0], setLoopOn = loopS[1];
+    var soloS = useState(false); var soloOn = soloS[0], setSoloOn = soloS[1];
+    // enter scoped mode on open (snapshot + pause global), exit on close (restore exact place)
+    useEffect(function () {
+      E.scope.enter({ startTick: clip.startTick, endTick: clip.startTick + steps * TPS, loop: true, soloId: null, owner: tab === "wave" ? "wave" : "piano" });
+      return function () { E.scope.exit(); };
+    }, []);
+    // keep the play button honest if a one-shot (loop-off) audition reaches the end
+    useEffect(function () { if (!auditioning) return; var iv = setInterval(function () { if (!E.scope.isPlaying()) setAuditioning(false); }, 120); return function () { clearInterval(iv); }; }, [auditioning]);
+    var audition = {
+      active: auditioning, loop: loopOn, solo: soloOn,
+      play: function () { E.scope.play(); setAuditioning(true); },
+      stop: function () { E.scope.pause(); setAuditioning(false); },
+      setLoop: function (on) { E.scope.setLoop(on); setLoopOn(on); },
+      setSolo: function (on) { E.scope.setSolo(on ? clip.ch : null); setSoloOn(on); },
+      setRange: function (s, e) { E.scope.setRange(clip.startTick + Math.round(s * TPS), clip.startTick + Math.round(e * TPS)); },
+      scrub: function (frac) { E.scope.scrub(clip.startTick + Math.round(frac * clip.lengthTicks)); }
+    };
+    // Phase 5 Fix 2: explicit ownership handoff — synchronously stop + clear the scoped voices BEFORE
+    // the newly-focused tab binds, so a Piano-Roll loop can't survive under a Waveform scrub.
+    function switchTab(id) {
+      if (id === tab) return;
+      try { window.engine.scope.stopScopeVoices(); } catch (e) {}
+      setAuditioning(false);
+      E.scope.setOwner(id === "wave" ? "wave" : "piano");
+      props.setTab(id);
+    }
+    var playStep = (auditioning && props.playTick != null && props.playTick >= 0) ? ((props.playTick - clip.startTick) / TPS) : -1;
+    var srcBufId = isPoly ? chDef.bufferId : null;
+    return h("div", { className: "overlay", onClick: function (e) { if (e.target === e.currentTarget) props.onClose(); } },
+      h("div", { className: "modal dual-editor", style: { width: 880, maxWidth: "95vw" } },
+        h("div", { className: "modal-head" },
+          h("div", { className: "mi" }, h(I.Piano || I.Note || I.Layers, null)),
+          h("h3", null, "Editor · ", chDef.label || "Clip",
+            h("span", { className: "ce-classbadge", title: "Track type" }, isAudio ? "Audio" : isPoly ? "Melody Maker" : (E.classifyChannel(clip.ch) === "melodic" ? "Melody" : "Drums")),
+            h("span", { className: "sub", style: { marginLeft: 8 } }, bars + (bars === 1 ? " bar" : " bars"))),
+          h("button", { className: "tbtn", style: { marginLeft: "auto", width: 32, height: 32 }, onClick: props.onClose }, h(I.X, { width: 16, height: 16 }))),
+        tabs.length > 1 ? h("div", { className: "de-tabs" }, tabs.map(function (t) { return h("button", { key: t.id, className: "de-tab" + (tab === t.id ? " on" : ""), onClick: function () { switchTab(t.id); } }, t.l); })) : null,
+        h("div", { className: "modal-body", style: { minHeight: 300 } },
+          tab === "piano" ? h(window.PianoRoll, { ch: chDef, pattern: api.toPattern(clip), steps: steps, playStep: playStep, rev: rs[0], triplet: props.triplet, audition: audition, onAddNote: api.add(clip), onUpdateNote: api.upd(clip), onRemoveNote: api.rem(clip), onPreview: function (p) { if (chDef.tonal) E.previewNote(clip.ch, p - (chDef.base || 0), 100); }, commit: bump }) : null,
+          tab === "wave" ? h(WaveEditor, { clip: clip, embedded: true, readOnly: isPoly, srcBufferId: srcBufId, audition: audition, playFrac: (playStep >= 0 && steps > 0) ? (playStep / steps) : -1, commit: bump, toast: props.toast, onClose: props.onClose }) : null),
+        h("div", { className: "modal-foot" }, h("button", { className: "btn primary", onClick: props.onClose }, "Done"))));
   }
 
   // ---------- app ----------
@@ -414,6 +497,9 @@
     var ecS = useState(null); var editClip = ecS[0], setEditClip = ecS[1];   // clip being isolated in the Piano Roll
     var ceS = useState(null); var clipEdit = ceS[0], setClipEdit = ceS[1];   // clip open in the Clip Editor overlay (Task 4)
     var weS = useState(null); var waveClip = weS[0], setWaveClip = weS[1];   // Phase 10: audio clip open in the Waveform Editor
+    var deS = useState(null); var dualClip = deS[0], setDualClip = deS[1];    // unified dual-tab editor (Piano Roll | Waveform)
+    var dtS = useState("piano"); var dualTab = dtS[0], setDualTab = dtS[1];   // active tab in the dual editor
+    var trS = useState(false); var triplet = trS[0], setTriplet = trS[1];     // Phase 3: triplet grid toggle (shared by Timeline + Piano Roll)
     var ps = useState(-1); var playStep = ps[0], setPlayStep = ps[1];
     var pbar = useState(-1); var playBar = pbar[0], setPlayBar = pbar[1];
     var fx = useState(null); var fxModal = fx[0], setFxModal = fx[1];
@@ -473,8 +559,10 @@
       E.setMode(mode); setPlaying(E.isPlaying);
     }, [view]);
 
-    function togglePlay() { if (E.isPlaying) { E.pause(); setPlaying(false); setPlayStep(-1); } else { E.start(mode); setPlaying(true); } }
-    function stop() { E.stop(); setPlaying(false); setPlayStep(-1); setPlayBar(-1); }
+    function togglePlay() { if (E.scope.isActive()) return; if (E.isPlaying) { E.pause(); setPlaying(false); setPlayStep(-1); } else { E.start(mode); setPlaying(true); } }   // ignore global transport while an audition scope owns playback
+    function stop() { if (E.scope.isActive()) return; E.stop(); setPlaying(false); setPlayStep(-1); setPlayBar(-1); }
+    // open a clip in the unified dual-tab editor: audio -> Waveform tab; midi/synth/polySampler -> Piano Roll tab
+    function openDual(clip) { if (!clip) return; doFocus(clip.ch); setDualTab(clip.kind === "audio" ? "wave" : "piano"); setDualClip(clip); }
     function pattern(i) { E.setActivePattern(i); setActive(i); bump(); }
     function doFocus(id) { setEditClip(null); setFocus(id); E.setFocus(id); var ch = E.channels[id]; if (ch) { if (ch.def.tonal) lastTonal.current = id; if (ch.route) setSelIns(ch.route); } }   // Phase 6: focusing a track selects its insert (by id) -> Mixer scrolls/highlights that strip
 
@@ -665,7 +753,7 @@
                         : prCh
                           ? h(window.PianoRoll, { ch: prCh, pattern: E.banks[active], steps: E.getPatternLength(active) * 16, lengthBars: E.getPatternLength(active), onSetLength: function (b) { E.setPatternLength(b, active); bump(); }, playStep: mode === "pattern" ? playStep : -1, rev: rev, onAddNote: function (c, p, s, l) { return E.addNote(c, p, s, l); }, onUpdateNote: function (id, patch) { E.updateNote(id, patch); }, onRemoveNote: function (id) { E.removeNote(id); }, onPreview: function (p) { if (prCh && prCh.tonal) E.previewNote(prCh.id, p - (prCh.base || 0), 100); }, commit: bump })
                           : h(EmptyPane, { title: "No tonal instrument", sub: "Add a melodic track (it routes here automatically)." }))
-                    : h(window.Timeline, { channels: E.channelDefs, playheadTick: playTick, tool: toolMode, onSetTool: setToolMode, onCommit: bump, onDeleteTrack: deleteTrack, onFocusStrip: doFocus, onScrub: function (tick) { E.seek(tick); setPlayTick(tick); }, onOpenClip: function (clip) { doFocus(clip.ch); setView("piano"); setEditClip(clip); }, onOpenClipFx: openClipFx, onEditClip: function (clip) { doFocus(clip.ch); setClipEdit(clip); }, onOpenWave: function (clip) { doFocus(clip.ch); setWaveClip(clip); }, onToast: function (m) { toast(m, h(I.Mic, { width: 16, height: 16 })); } })),
+                    : h(window.Timeline, { channels: E.channelDefs, playheadTick: playTick, tool: toolMode, onSetTool: setToolMode, triplet: triplet, onSetTriplet: setTriplet, onCommit: bump, onDeleteTrack: deleteTrack, onFocusStrip: doFocus, onScrub: function (tick) { E.seek(tick); setPlayTick(tick); }, onOpenClip: openDual, onOpenClipFx: openClipFx, onEditClip: openDual, onOpenWave: openDual, onToast: function (m) { toast(m, h(I.Mic, { width: 16, height: 16 })); } })),
               h("div", { className: "dashboard" },
                 h(window.Mixer, { inserts: insertState, selected: selIns, master: master, focusCh: focusCh, pattern: E.banks[active], rev: rev, playStep: mode === "pattern" ? playStep : -1, onSetStep: setStep, onSelect: setSelIns, onVol: insVol, onPan: insPan, onMute: insMute, onSolo: insSolo, onMasterVol: function (v) { E.setMaster(v); setMaster(v); }, onFxClick: function (id, slot) { setFxModal({ id: id, slot: slot }); }, onCommit: bump }))))),
         (clipEdit && E.timeline.clips.indexOf(clipEdit) >= 0) ? h(ClipEditor, {
@@ -676,6 +764,12 @@
         (waveClip && E.timeline.clips.indexOf(waveClip) >= 0) ? h(WaveEditor, {
           clip: waveClip, commit: bump, toast: function (m) { toast(m, h(I.Wave, { width: 16, height: 16 })); },
           onClose: function () { setWaveClip(null); } }) : null,
+        (dualClip && E.timeline.clips.indexOf(dualClip) >= 0) ? h(DualEditor, {
+          clip: dualClip, chDef: (E.channels[dualClip.ch] && E.channels[dualClip.ch].def) || prCh, commit: bump,
+          api: { toPattern: clipToPattern, add: clipAddNote, upd: clipUpdNote, rem: clipRemNote },
+          triplet: triplet, playTick: playTick, tab: dualTab, setTab: setDualTab,
+          toast: function (m) { toast(m, h(I.Wave, { width: 16, height: 16 })); },
+          onClose: function () { setDualClip(null); } }) : null,
         fxModal ? h(FXModal, { id: fxModal.id, slot: fxModal.slot, clip: fxModal.clip, onClose: function () { setFxModal(null); }, commit: bump }) : null,
         showEx ? h(RenderModal, { onClose: function () { setShowEx(false); }, onStopped: function () { setPlaying(false); setPlayStep(-1); }, toast: toast }) : null,
         h("div", { className: "toast-wrap" }, toasts.map(function (x) { return h("div", { className: "toast", key: x.id }, h("span", { className: "ti" }, x.ic), x.m); }))),

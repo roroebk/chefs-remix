@@ -97,12 +97,23 @@
     // are tick-based, so snapping/trims stay locked to the project tempo with no float drift.
     function snapTicks() {
       var q = ppb;                              // px per quarter note
+      // Phase 3: triplet grid lives ALONGSIDE the duple divisions, behind props.triplet. Standard
+      // triplet spacing: 1/8T = PPQ/3 (3 per quarter), 1/16T = PPQ/6 (6 per quarter). Notes already
+      // on duple ticks keep their absolute positions — only NEW placement/resize snaps to the active
+      // division, so toggling never re-quantizes existing notes.
+      if (props.triplet) {
+        if (q >= 48) return PPQ / 6;            // 1/16T
+        return PPQ / 3;                          // 1/8T
+      }
       if (q >= 96) return PPQ / 8;              // 1/32
       if (q >= 48) return PPQ / 4;              // 1/16
       if (q >= 24) return PPQ / 2;              // 1/8
       return PPQ;                               // 1/4
     }
-    function snapLabel() { var s = snapTicks(); return s === PPQ / 8 ? "1/32" : s === PPQ / 4 ? "1/16" : s === PPQ / 2 ? "1/8" : "1/4"; }
+    function snapLabel() {
+      if (props.triplet) return ppb >= 48 ? "1/16T" : "1/8T";
+      var s = snapTicks(); return s === PPQ / 8 ? "1/32" : s === PPQ / 4 ? "1/16" : s === PPQ / 2 ? "1/8" : "1/4";
+    }
     function snap(t, free) { var S = snapTicks(); return free ? Math.round(t) : Math.round(t / S) * S; }
     function laneIndex(ch) { for (var i = 0; i < lanes.length; i++) if (lanes[i].id === ch) return i; return -1; }
     // cumulative content-space vertical bounds per lane id. Each lane is TL_LANE tall; an open
@@ -417,6 +428,7 @@
           h("button", { className: "tl-tool", title: "Split at playhead (S) — slices the selected clip(s), or whatever the playhead crosses", onClick: doSplit }, "✂")),
         h("span", { className: "tl-hint" }, "Click empties / drag the playhead to scrub · marquee a group then drag any clip to move all · trim a clip's right edge"),
         h("span", { className: "tl-snapchip", title: "Adaptive grid — subdivides automatically as you zoom" }, "GRID ", h("b", null, snapLabel())),
+        h("button", { className: "tl-tripchip" + (props.triplet ? " on" : ""), title: "Triplet grid (1/8T · 1/16T) — alongside the duple divisions", onClick: function () { props.onSetTriplet && props.onSetTriplet(!props.triplet); } }, "T³"),
         h("div", { className: "tl-zoom" }, h("span", { className: "lbl" }, "ZOOM"),
           h("input", { type: "range", className: "slider", min: 4, max: 200, step: 1, value: ppb, onChange: function (e) { setPpb(parseFloat(e.target.value)); } }),
           h("span", { className: "mono" }, Math.round(ppb) + "px/♪")),

@@ -771,6 +771,9 @@ button { font-family: inherit; color: inherit; cursor: pointer; border: none; ba
 /* adaptive-grid readout chip (timeline + piano roll toolbars) */
 .tl-snapchip { font-size: 9px; letter-spacing: 0.12em; color: var(--dim); background: var(--surface-3); border: 1px solid var(--hairline); border-radius: 6px; padding: 3px 8px; white-space: nowrap; }
 .tl-snapchip b { color: var(--accent); font-family: var(--mono); letter-spacing: 0; margin-left: 2px; }
+.tl-tripchip { font-size: 10px; font-weight: 800; letter-spacing: 0.04em; color: var(--dim); background: var(--surface-3); border: 1px solid var(--hairline); border-radius: 6px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
+.tl-tripchip:hover { color: var(--text-hi); }
+.tl-tripchip.on { color: #fff; background: color-mix(in srgb,var(--accent) 60%, var(--surface-3)); border-color: var(--accent); box-shadow: 0 0 calc(8px*var(--glow)) color-mix(in srgb,var(--accent) 50%, transparent); }
 /* linked-folder real files get a faint marker dot */
 .trow.sample.userfile .swatch { box-shadow: 0 0 0 1.5px color-mix(in srgb, #ffb338 60%, transparent); }
 .tl-empty { padding: 44px 24px; text-align: center; color: var(--faint); font-size: 13px; }
@@ -979,6 +982,27 @@ button { font-family: inherit; color: inherit; cursor: pointer; border: none; ba
 .wave-ctl input[type=range] { flex: 1; }
 .wave-ctl .mono { width: 48px; text-align: right; font-size: 10px; color: var(--accent-3); }
 .wave-ctl .btn { padding: 5px 12px; }
+.wave-ctl input[disabled] { opacity: 0.4; cursor: not-allowed; }
+.wave-ctl .btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+
+/* ---------- audition transport (Piano Roll + Waveform) ---------- */
+.pr-audition { display: inline-flex; align-items: center; gap: 3px; margin-left: 8px; padding: 2px 5px; background: var(--surface-3); border: 1px solid var(--hairline); border-radius: 7px; }
+.pr-aud { min-width: 22px; height: 22px; padding: 0 5px; font-size: 11px; font-weight: 800; color: var(--dim); background: var(--surface-2); border: 1px solid var(--hairline); border-radius: 5px; cursor: pointer; line-height: 1; display: inline-flex; align-items: center; justify-content: center; }
+.pr-aud:hover { color: var(--text-hi); }
+.pr-aud.on { color: #fff; background: color-mix(in srgb,var(--accent) 60%, var(--surface-3)); border-color: var(--accent); box-shadow: 0 0 calc(7px*var(--glow)) color-mix(in srgb,var(--accent) 50%, transparent); }
+.pr-aud.play.on { background: color-mix(in srgb,#39d98a 60%, var(--surface-3)); border-color: #39d98a; box-shadow: 0 0 calc(7px*var(--glow)) rgba(57,217,138,0.5); }
+.pr-ruler { position: absolute; left: 0; top: 0; width: 100%; height: 12px; background: linear-gradient(180deg, rgba(157,78,221,0.18), transparent); border-bottom: 1px solid var(--hairline-2); cursor: ew-resize; z-index: 6; }
+.pr-loopreg { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb,var(--accent) 12%, transparent); border-left: 1px solid var(--accent); border-right: 1px solid var(--accent); z-index: 1; pointer-events: none; }
+
+/* ---------- dual-tab editor panel ---------- */
+.modal.dual-editor { width: 880px; }
+.de-tabs { display: flex; gap: 4px; padding: 0 16px; border-bottom: 1px solid var(--hairline); }
+.de-tab { padding: 8px 18px; font-size: 12px; font-weight: 700; color: var(--dim); background: transparent; border: none; border-bottom: 2px solid transparent; cursor: pointer; }
+.de-tab:hover { color: var(--text-hi); }
+.de-tab.on { color: var(--accent); border-bottom-color: var(--accent); }
+.wave-embed { display: block; }
+.wave-embed .wave-canvas { display: block; width: 100%; height: 200px; border-radius: 8px; border: 1px solid var(--hairline); background: var(--surface-0); }
+.wave-audbar { display: flex; align-items: center; gap: 4px; margin-bottom: 10px; }
 
 /* ---------- insert fx rack panel ---------- */
 .ifx-rack { width: 218px; flex: none; display: flex; flex-direction: column; background: linear-gradient(180deg, var(--surface-2), var(--surface-1)); border-left: 1px solid var(--hairline); }
