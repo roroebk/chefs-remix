@@ -416,8 +416,10 @@
     return h("div", { className: "tl" },
       h("div", { className: "tl-toolbar" },
         h("span", { className: "tl-title" }, "TIMELINE"),
-        h("button", { className: "tl-rec" + (recKind === "mic" ? " on" : ""), onClick: onRecClick, disabled: recKind === "screen", title: "Record microphone audio onto the timeline (1-bar count-in)" },
-          h("span", { className: "tl-rec-dot" }), (recKind === "mic" && recPhase === "recording") ? "Stop" : recPhase === "countin" ? "Count-in…" : "Rec Audio"),
+        // The old inline mic "Rec Audio" button was retired — audio tracking now lives in the
+        // top-bar [Producer] | [Rec Audio] Studio Mode toggle (Studio Build 1). The engine's
+        // mic-record plumbing (onRecClick/startTimelineRecording) stays intact but unreferenced;
+        // live capture returns in Studio Sprint B.
         h("button", { className: "tl-rec screen" + (recKind === "screen" ? " on" : ""), onClick: onScreenClick, disabled: recPhase !== "idle" && recKind !== "screen", title: "Capture audio from a screen, window, or browser tab — choose a source and tick “Share audio”" },
           h(I.Monitor, { width: 13, height: 13 }), recKind === "screen" ? "Stop" : "Rec Screen"),
         h("button", { className: "tl-mon" + (monitor ? " on" : ""), onClick: function () { setMonitor(!monitor); }, title: "Input monitoring (use headphones to avoid feedback)" },

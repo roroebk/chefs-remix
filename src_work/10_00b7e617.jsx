@@ -78,8 +78,12 @@
         h("div", { className: "knob-wrap" }, h("span", { className: "lbl", style: { writingMode: "horizontal-tb" } }, "SWING"),
           h("input", { className: "slider swing-mini", type: "range", min: 0, max: 1, step: 0.01, value: props.swing, onChange: function (e) { props.onSwing(parseFloat(e.target.value)); } }),
           h("span", { className: "mono", style: { fontSize: 12, color: "var(--accent)", width: 34 } }, Math.round(props.swing * 100) + "%"))),
+      h("div", { className: "t-group" },
+        h("div", { className: "mode-toggle", title: "Switch between the beatmaking workspace and the audio-tracking Studio" },
+          h("button", { className: "mt-opt" + (props.studio ? "" : " on"), onClick: function () { if (props.studio) props.onToggleStudio(false); } }, "Producer"),
+          h("button", { className: "mt-opt rec" + (props.studio ? " on" : ""), onClick: function () { if (!props.studio) props.onToggleStudio(true); } }, h(I.Rec, { width: 12, height: 12 }), "Rec Audio"))),
       h("div", { className: "t-group spectrum-wrap" }, h(W.SpectrumAnalyzer, null)),
-      h("button", { className: "btn", onClick: props.onExport }, [h(I.Download, { width: 16, height: 16, key: 1 }), "Export"]));
+      h(ExportMenu, { onProducer: props.onProducerMaster, onRecAudio: props.onRecAudioMaster, exporting: props.exporting, exportProg: props.exportProg, recAvailable: props.recAvailable }));
   }
 
   // ---------- export modal ----------
@@ -124,6 +128,21 @@
                   h("button", { className: "btn", style: { flex: 1, justifyContent: "center", height: 44 }, onClick: renderStems }, [h(I.Layers, { width: 16, height: 16, key: 1 }), "Stems (ZIP)"]),
                   h("button", { className: "btn ghost", style: { height: 44 }, onClick: saveProjectJson }, [h(I.Book, { width: 15, height: 15, key: 1 }), "Save Project (.json)"])))),
         phase === "done" ? h("div", { className: "modal-foot" }, h("button", { className: "btn primary", onClick: props.onClose }, "Done")) : null));
+  }
+
+  // top-bar Export → two-target master-mix dropdown (Producer / Rec Audio). Reentry-guarded via the
+  // App's `exporting` state; the busy item shows inline progress; Rec Audio disabled when empty.
+  function ExportMenu(props) {
+    var o = useState(false); var open = o[0], setOpen = o[1];
+    var busy = props.exporting;   // "producer" | "recaudio" | null
+    return h("div", { className: "export-menu" },
+      h("button", { className: "btn", onClick: function () { setOpen(!open); }, title: "Export a master mix (WAV)" }, [h(I.Download, { width: 16, height: 16, key: 1 }), "Export ▾"]),
+      open ? h("div", { className: "export-dd" },
+        h("div", { className: "export-sec" }, "MASTER MIX (WAV)"),
+        h("button", { className: "export-item", disabled: !!busy, onClick: function () { props.onProducer(); } },
+          busy === "producer" ? ("Producer — rendering " + Math.round(props.exportProg * 100) + "%") : "Master Mix — Producer"),
+        h("button", { className: "export-item", disabled: !!busy || !props.recAvailable, title: props.recAvailable ? "Backing + unmuted audio lanes through their plugin chains" : "Nothing to mix yet", onClick: function () { if (props.recAvailable && !busy) props.onRecAudio(); } },
+          busy === "recaudio" ? ("Rec Audio — rendering " + Math.round(props.exportProg * 100) + "%") : "Master Mix — Rec Audio")) : null);
   }
 
   // ---------- studio deployment gateway (splash) ----------
@@ -457,6 +476,165 @@
         h("div", { className: "modal-foot" }, h("button", { className: "btn primary", onClick: props.onClose }, "Done"))));
   }
 
+  // ============================================================================
+  // STUDIO MODE — audio-tracking suite that swaps in beneath the top bar when
+  // [Rec Audio] is active. Shares the single transport (never mount-binds it).
+  // RESTRUCTURE: left Track Source · center-top lane matrix · center-bottom compact
+  // Record bar + single-track "Plugins" panel (file 07, window.StudioPlugins).
+  // ============================================================================
+
+  // ---- Studio track model (session-scoped, additive — no engine schema change) ----
+  // The prompt's model `type` is stored as `def.trackType` to avoid colliding with the
+  // engine's voice-`type` (kick/sampler/audio/…). Backing tracks stay clip-driven; the
+  // engine def.type/kind are untouched. pluginState/meta live on the def; they survive
+  // dropdown switches / arming / re-renders (reset on full reload — session-scoped).
+  function defaultPluginState() {
+    return {
+      inputGain: 1,
+      pitchFix: { mode: "auto", params: { retuneSpeed: 40, tightness: 0.5, scale: "chromatic", key: "C", bypass: false }, graph: { points: [], interp: "linear" } },
+      saturation: { drive: 0, mix: 0 },
+      eq: { low: 0, mid: 0, high: 0, cutoff: 20000 },
+      compressor: { threshold: 0, ratio: 1, makeup: 0, multiband: false },
+      deesser: { amount: 0, freq: 6000 },
+      spatial: { width: 0, x: 0.5, y: 0.5 },
+      delay: { div: "1/8", fb: 0.25, mix: 0 },
+      reverb: { size: 2.4, wet: 0 },
+      routing: { route: null, output: 1 }
+    };
+  }
+  // lazily attach the model to a channel def (idempotent). Called wherever Studio reads tracks.
+  function ensureStudioModel(def) {
+    if (!def) return def;
+    if (!def.trackType) def.trackType = (def.backing || def.locked) ? "backing" : "audio";
+    if (!def.pluginState) def.pluginState = defaultPluginState();
+    if (def.sourceFileId === undefined) def.sourceFileId = def.bufferId || null;
+    if (def.deletedAt === undefined) def.deletedAt = null;
+    if (!def.meta) def.meta = { created: 0, source: def.trackType === "backing" ? "bounced" : "recorded", readOnly: def.trackType === "backing" };
+    return def;
+  }
+  function isBackingDef(def) { return !!(def && (def.trackType === "backing" || def.backing || def.locked)); }
+  // Studio track list: backing tracks sorted FIRST (top), then editable audio lanes.
+  function studioTracks(channelDefs) {
+    var lanes = channelDefs.filter(function (c) { return c.type === "audio" || c.kind === "audioLane"; }).map(ensureStudioModel);
+    return lanes.slice().sort(function (a, b) { return (isBackingDef(b) ? 1 : 0) - (isBackingDef(a) ? 1 : 0); });
+  }
+
+  // long read-only waveform for a Studio lane (draws a clip's precomputed peaks)
+  function LaneWave(props) {
+    var ref = useRef(null);
+    useEffect(function () {
+      var cv = ref.current; if (!cv) return;
+      var r = cv.getBoundingClientRect(); cv.width = Math.max(8, r.width * 2); cv.height = Math.max(8, r.height * 2);
+      var ctx = cv.getContext("2d"), Wd = cv.width, Hd = cv.height, mid = Hd / 2;
+      ctx.clearRect(0, 0, Wd, Hd);
+      var peaks = props.peaks || []; if (!peaks.length) return;
+      ctx.strokeStyle = props.color || "rgba(157,78,221,0.95)"; ctx.lineWidth = 1; ctx.beginPath();
+      for (var x = 0; x < Wd; x++) { var pi = Math.floor((x / Wd) * peaks.length); var a = Math.min(1, (peaks[pi] || 0)); ctx.moveTo(x + 0.5, mid - a * mid * 0.94); ctx.lineTo(x + 0.5, mid + a * mid * 0.94); }
+      ctx.stroke();
+    }, [props.peaks, props.rev, props.w]);
+    return h("canvas", { className: "lane-wave", ref: ref });
+  }
+
+  // left panel: track-source manager (Import section hidden in Rec Audio; lives in Producer only)
+  function TrackSourceManager(props) {
+    var upRef = useRef(null);
+    var tracks = props.tracks;
+    return h("div", { className: "studio-tracks" },
+      h("div", { className: "st-head" }, h("span", { className: "st-ttl" }, "TRACK SOURCE"), h("span", { className: "st-sub" }, "Rec Audio")),
+      h("div", { className: "st-sect" },
+        h("div", { className: "st-lbl" }, "PROJECT / BACKING"),
+        props.bouncing
+          ? h("div", { className: "st-prog" }, h("div", { className: "st-prog-fill", style: { width: Math.round(props.bounceProg * 100) + "%" } }), h("span", { className: "st-prog-t mono" }, "Bouncing… " + Math.round(props.bounceProg * 100) + "%"))
+          : h("button", { className: "st-btn primary", onClick: props.onBounce, title: "Render the current Producer arrangement to a single stereo mix and load it as a locked Project track" }, h(I.Download, { width: 15, height: 15 }), "Add Producer Track"),
+        h("button", { className: "st-btn", onClick: function () { upRef.current && upRef.current.click(); }, title: "Upload a WAV/MP3 as a locked Project track" }, h(I.Wave, { width: 15, height: 15 }), "Upload Audio (WAV/MP3)"),
+        h("input", { ref: upRef, type: "file", accept: "audio/*", style: { display: "none" }, onChange: function (e) { if (e.target.files && e.target.files[0]) props.onUpload(e.target.files[0]); e.target.value = ""; } })),
+      h("div", { className: "st-sect grow" },
+        h("div", { className: "st-lbl" }, "TRACKS · " + tracks.length),
+        tracks.length
+          ? tracks.map(function (c) {
+              var backing = isBackingDef(c); var muted = !!c.uiMuted;
+              // M/✕ live ONLY here (the far-left TRACKS list). Backing rows: [M] + [↻ re-bounce] (no ✕).
+              return h("div", { key: c.id, className: "st-track" + (props.selected === c.id ? " sel" : "") + (backing ? " locked" : "") + (muted ? " muted" : ""), onClick: function () { props.onSelect(c.id, true); } },
+                h("span", { className: "st-tdot", style: { background: c.color || "var(--accent)" } }),
+                h("span", { className: "st-tname" }, c.label),
+                backing ? h("span", { className: "st-tlock", title: "Locked Project track" }, "🔒") : null,
+                h("button", { className: "sm-mute" + (muted ? " on" : ""), "aria-label": muted ? "Unmute track" : "Mute track", onClick: function (e) { e.stopPropagation(); props.onMute(c.id); }, title: muted ? "Unmute (M)" : "Mute (M)" }, "M"),
+                backing
+                  ? h("button", { className: "sm-replace", disabled: props.bouncing, "aria-label": "Replace backing", onClick: function (e) { e.stopPropagation(); props.onReplace(c.id); }, title: "Replace backing (re-bounce the current arrangement in place)" }, "↻")
+                  : h("button", { className: "sm-del", "aria-label": "Delete track", onClick: function (e) { e.stopPropagation(); props.onDelete(c.id); }, title: "Delete track (Del)" }, "✕"));
+            })
+          : h("div", { className: "st-empty" }, "No tracks yet — Add Producer Track or Add Track.")));
+  }
+
+  // center-top: audio-lane matrix (read-only waveforms) + inline [M]/[✕] + arm-on-click + Add Track
+  function AudioLaneMatrix(props) {
+    var lanes = props.tracks;
+    var songTicks = Math.max(1, E.timeline.lengthTicks || 1);
+    var phPct = (props.playing && props.playTick >= 0) ? Math.max(0, Math.min(100, (props.playTick / songTicks) * 100)) : -1;
+    return h("div", { className: "studio-matrix" },
+      h("div", { className: "sm-head" },
+        h("span", { className: "pt" }, "Audio Tracking"),
+        h("span", { className: "sub" }, "Arm a lane, then hit RECORD · " + lanes.length + " lane" + (lanes.length === 1 ? "" : "s")),
+        h("button", { className: "sm-addtrack", onClick: props.onAddTrack }, h(I.Plus, { width: 14, height: 14 }), "Add Track")),
+      h("div", { className: "sm-lanes" },
+        phPct >= 0 ? h("div", { className: "sm-playhead", style: { left: "calc(220px + (100% - 220px) * " + (phPct / 100) + ")" } }) : null,
+        lanes.length
+          ? lanes.map(function (c) {
+              var clips = E.timeline.clips.filter(function (cl) { return cl.ch === c.id && cl.kind === "audio"; });
+              var clip = clips[0];
+              var isArmed = props.armed === c.id;
+              var backing = isBackingDef(c);
+              var muted = !!c.uiMuted;
+              return h("div", { key: c.id, className: "sm-lane" + (props.selected === c.id ? " sel" : "") + (isArmed ? " armed" : "") + (backing ? " locked" : "") + (muted ? " muted" : ""), onClick: function () { props.onSelect(c.id, true); } },
+                h("div", { className: "sm-lanehead" },
+                  h("span", { className: "sm-dot", style: { background: c.color || "var(--accent)" } }),
+                  h("span", { className: "sm-lname" }, c.label),
+                  // M/✕/↻ consolidated to the left TRACKS list — lane headers keep only name + ARM state.
+                  backing
+                    ? h("span", { className: "sm-badge lock", title: "PROJECT — BACKING (READ ONLY) · Rendered mixdown. To update, re-bounce or upload a new backing." }, "PROJECT — BACKING")
+                    : h("button", { className: "sm-arm" + (isArmed ? " on" : ""), "aria-label": isArmed ? "Disarm track" : "Arm track", onClick: function (e) { e.stopPropagation(); props.onArm(isArmed ? null : c.id); }, title: "Arm this lane for recording" }, isArmed ? "ARMED" : "ARM")),
+                h("div", { className: "sm-lanebody" + (clip ? "" : " empty"), onClick: function (e) { if (!clip && !backing) { e.stopPropagation(); props.onArm(c.id); } } },
+                  clip ? h(LaneWave, { peaks: clip.peaks, color: backing ? "rgba(199,125,255,0.9)" : "rgba(157,78,221,0.95)", rev: props.rev }) : h("span", { className: "sm-emptyhint" }, isArmed ? "Armed — RECORD is stubbed this build" : "Empty lane — click to arm")));
+            })
+          : h("div", { className: "sm-noneyet" }, "No audio lanes. Add a track or Add Producer Track to start tracking.")));
+  }
+
+  // bottom bar LEFT zone: large circular Record with animated sound-wave rings (dominant element),
+  // RECORD label beneath; mini Play/Stop + master VU + armed readout subordinate.
+  function RecordBar(props) {
+    var armed = !!props.armed;
+    var d = armed && E.channels[props.armed] ? E.channels[props.armed].def : null;
+    return h("div", { className: "rec-zone" },
+      h("div", { className: "rz-ttl" }, "TRANSPORT"),
+      // centerpiece: the circular Record button + rings + label, centered in the zone's free space
+      h("div", { className: "rec-center" },
+        h("div", { className: "rec-circle-wrap" + (armed ? " armed" : "") },
+          h("span", { className: "rec-ring r1" }), h("span", { className: "rec-ring r2" }), h("span", { className: "rec-ring r3" }),
+          h("button", { className: "rec-circle" + (armed ? " armed" : ""), disabled: !armed, onClick: function () { if (armed) props.onRecord(); }, title: armed ? "Record to armed tracks" : "Arm an unlocked track to enable recording", "aria-label": "Record" },
+            h("span", { className: "rec-circle-dot" }))),
+        h("div", { className: "rec-circle-label" }, "RECORD")),
+      // subordinate transport controls + armed readout at the bottom of the zone
+      h("div", { className: "rz-foot" },
+        h("div", { className: "rz-mini" },
+          h("button", { className: "rz-play" + (props.playing ? " on" : ""), onClick: props.onPlay, title: props.playing ? "Pause" : "Play", "aria-label": props.playing ? "Pause" : "Play" }, props.playing ? h(I.Stop, { width: 12, height: 12 }) : h(I.Play, { width: 12, height: 12 })),
+          h("button", { className: "rz-stop", onClick: props.onStop, title: "Stop", "aria-label": "Stop" }, h(I.Stop, { width: 10, height: 10 })),
+          h("div", { className: "rz-vu" }, h(W.MeterBar, { master: true, idx: 0 }), h(W.MeterBar, { master: true, idx: 1 }))),
+        h("div", { className: "rz-state" }, armed ? ("Armed: " + (d ? d.label : "") + " · capture preview (Sprint B)") : "No track armed")));
+  }
+
+  function StudioMode(props) {
+    var tracks = studioTracks(props.channelDefs);
+    return h("div", { className: "studio" },
+      h(TrackSourceManager, { tracks: tracks, selected: props.selected, bouncing: props.bouncing, bounceProg: props.bounceProg, onBounce: props.onBounce, onUpload: props.onUpload, onSelect: props.onSelect, onMute: props.onMute, onDelete: props.onDelete, onReplace: props.onReplace }),
+      h("div", { className: "studio-center" },
+        h(AudioLaneMatrix, { tracks: tracks, selected: props.selected, armed: props.armed, playing: props.playing, playTick: props.playTick, rev: props.rev, onArm: props.onArm, onSelect: props.onSelect, onAddTrack: props.onAddTrack }),
+        h("div", { className: "studio-bottombar" },
+        h(RecordBar, { armed: props.armed, onRecord: props.onRecord, playing: props.playing, onPlay: props.onPlay, onStop: props.onStop }),
+        window.StudioPlugins
+          ? h(window.StudioPlugins, { tracks: tracks, selected: props.selected, armed: props.armed, followArmed: props.followArmed, bpm: props.bpm, rev: props.rev, triplet: props.triplet, bouncing: props.bouncing, onSelect: props.onSelect, onToggleFollow: props.onToggleFollow, onMute: props.onMute, onDelete: props.onDelete, onReplace: props.onReplace, commit: props.commit })
+          : null)));
+  }
+
   // ---------- app ----------
   function App() {
     var tw = window.useTweaks(TWEAK_DEFAULTS); var t = tw[0], setTweak = tw[1];
@@ -504,7 +682,19 @@
     var pbar = useState(-1); var playBar = pbar[0], setPlayBar = pbar[1];
     var fx = useState(null); var fxModal = fx[0], setFxModal = fx[1];
     var exm = useState(false); var showEx = exm[0], setShowEx = exm[1];
+    var exM = useState(null); var exporting = exM[0], setExporting = exM[1];   // "producer" | "recaudio" | null
+    var exP = useState(0); var exportProg = exP[0], setExportProg = exP[1];
     var T = useToasts(); var toasts = T[0], toast = T[1];
+    // Studio Mode (Build 1): [Producer] | [Rec Audio] layout switch beneath the top bar
+    var stM = useState(false); var studio = stM[0], setStudio = stM[1];
+    var stSel = useState(null); var studioSel = stSel[0], setStudioSel = stSel[1];   // selected Studio track (chId)
+    var stArm = useState(null); var studioArm = stArm[0], setStudioArm = stArm[1];   // armed Studio lane (chId)
+    var stB = useState(false); var bouncing = stB[0], setBouncing = stB[1];
+    var stBp = useState(0); var bounceProg = stBp[0], setBounceProg = stBp[1];
+    var stFa = useState(false); var followArmed = stFa[0], setFollowArmed = stFa[1];   // Plugins dropdown follows the armed track (one-way); default OFF
+    var stDc = useState(null); var delConfirm = stDc[0], setDelConfirm = stDc[1];     // pending delete-confirm {id,label}
+    var recycleRef = useRef([]);                                                       // session recycle buffer for soft-deleted tracks
+    var studioKbdRef = useRef({});                                                     // live mirror for the global key handler (Studio shortcuts)
 
     useEffect(function () {
       E.onStep = function (step, bar) { setPlayStep(step); if (bar >= 0) setPlayBar(bar); else setPlayBar(-1); };
@@ -517,6 +707,17 @@
         if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
         var ctrlK = e.ctrlKey || e.metaKey;
         if (ctrlK && e.code === "KeyK") { e.preventDefault(); setPaletteOpen(true); return; }
+        // Studio shortcuts (M mute · Del delete · R arm · Ctrl/Cmd+Z undo soft-delete) — take precedence
+        // over the Producer hotkeys while Rec Audio is active; input-focus already guarded above.
+        var sk = studioKbdRef.current;
+        if (sk && sk.studio) {
+          if (ctrlK && e.code === "KeyZ" && !e.shiftKey) { e.preventDefault(); sk.undo(); return; }
+          if (!ctrlK && !e.altKey && !e.shiftKey) {
+            if (e.code === "KeyM") { e.preventDefault(); if (sk.sel) sk.mute(sk.sel); return; }
+            if (e.code === "Delete" || e.code === "Backspace") { e.preventDefault(); if (sk.sel) sk.del(sk.sel); return; }
+            if (e.code === "KeyR") { e.preventDefault(); if (sk.sel) sk.armfn(sk.sel); return; }
+          }
+        }
         if (ctrlK && e.code === "KeyZ" && !e.shiftKey) { e.preventDefault(); doUndo(); return; }
         if (ctrlK && (e.code === "KeyY" || (e.code === "KeyZ" && e.shiftKey))) { e.preventDefault(); doRedo(); return; }
         // single-key tool/transport hotkeys (R arm · V arrow · M marquee) — not musical keys
@@ -636,6 +837,139 @@
     // Phase 5: addSynth() and the [Synth] UI entry points were removed — melodic tracks come from
     // Melody Maker (polySampler). engine.addSynthTrack / the oscillator voice remain, dormant.
     function deleteTrack(id) { var ch = E.channels[id]; var label = ch ? ch.def.label : "Track"; E.removeChannel(id); if (lastTonal.current === id) lastTonal.current = null; setFocus(E.focus); E.setFocus(E.focus); bump(); toast(label + " removed", h(I.Trash, { width: 16, height: 16 })); }
+
+    // ---- Studio Mode wiring (Build 1) --------------------------------------
+    // Silence-on-switch: synchronously de-click/kill any sounding voices via the SHARED scope handle
+    // BEFORE the layout state flips, so no prior-mode audio bleeds under the new screen. Reuses the
+    // existing engine.scope lifecycle — no parallel mechanism. The transport itself stays unified.
+    function toggleStudio(next) { try { E.scope.stopScopeVoices(); } catch (e) {} E._recMode = next; setStudio(next); }   // mode-scoped playback: engine sounds only the active tab's channel set
+    // load a decoded buffer as a locked "Project" backing track (bounce OR upload). Always labeled
+    // "Project"; type:'backing' (trackType), locked/read-only. Backing tracks stack (append) — never
+    // a lane-0 race — and render sorted-first in the Studio views.
+    function loadBacking(source, buf, blob) {
+      var r = E.addMelodyFile("Project", buf, blob);
+      if (r && r.def) {
+        r.def.backing = true; r.def.locked = true; r.def.trackType = "backing";
+        r.def.meta = { created: 0, source: source, readOnly: true };
+        ensureStudioModel(r.def);
+        setStudioSel(r.def.id); setFollowArmed(false);   // a backing selection is a manual, read-only focus
+      }
+      setView("timeline"); setFocus(E.focus); bump();
+      toast("Project track loaded", h(I.Wave, { width: 16, height: 16 }));
+    }
+    // "Add Producer Track" — bounce the CURRENTLY loaded arrangement via renderMixdown (no state swap).
+    // Reentry-guarded by `bouncing` (button shows progress + disables for the render duration).
+    function bounceCurrent() {
+      if (bouncing) return;
+      setBouncing(true); setBounceProg(0);
+      E.renderMixdown(function (pr) { setBounceProg(pr); }, function (blob) {
+        setBouncing(false);
+        if (!blob) { toast("Bounce failed", h(I.X, null)); return; }
+        E.decodeAudioFile(blob, function (buf) { loadBacking("bounced", buf, blob); }, function () { toast("Could not decode bounce", h(I.X, null)); });
+      });
+    }
+    // Option B — upload a WAV/MP3 as the backing track
+    function uploadBacking(file) {
+      E.decodeAudioFile(file, function (buf) { loadBacking("uploaded", buf, file); }, function () { toast("Could not decode " + file.name, h(I.X, null)); });
+    }
+    // Replace Backing — re-bounce the current arrangement and swap the backing clip's buffer IN PLACE
+    // (same channel id / route / clip id). Reentry-guarded; synchronous stop first. No delete+recreate.
+    function replaceBacking(id) {
+      if (bouncing) return;
+      var ch = E.channels[id]; if (!ch) return;
+      var clip = E.timeline.clips.filter(function (cl) { return cl.ch === id && cl.kind === "audio"; })[0];
+      if (!clip) { toast("No backing clip to replace", h(I.X, null)); return; }
+      studioStop();                                          // de-click if the backing is sounding
+      setBouncing(true); setBounceProg(0);
+      E.renderMixdown(function (pr) { setBounceProg(pr); }, function (blob) {
+        setBouncing(false);
+        if (!blob) { toast("Re-bounce failed", h(I.X, null)); return; }
+        E.decodeAudioFile(blob, function (buf) {
+          E.userBuffers[clip.bufferId] = buf;                // atomic in-place swap
+          clip.peaks = E.computePeaks(buf);
+          clip.lengthTicks = Math.max(E.SNAP_TICKS, E.secToTick(buf.duration));
+          clip.trimmed = false; clip.offsetTicks = 0;
+          if (blob instanceof Blob) { try { E.SampleDB && E.SampleDB.put(clip.bufferId, blob); } catch (e) {} }
+          E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
+          bump(); toast("Backing replaced (re-bounced)", h(I.Wave, { width: 16, height: 16 }));
+        }, function () { toast("Could not decode re-bounce", h(I.X, null)); });
+      });
+    }
+    // reuse the FileBrowser import flows from the Studio panel via a transient picker
+    function pickFiles(accept, multiple, cb) { var inp = document.createElement("input"); inp.type = "file"; inp.accept = accept; if (multiple) inp.multiple = true; inp.onchange = function () { if (inp.files && inp.files.length) cb(inp.files); }; inp.click(); }
+    function studioAddMelody() { pickFiles("audio/*,video/*", true, function (files) { Array.prototype.forEach.call(files, function (f) { E.decodeAudioFile(f, function (buf) { E.addMelodyFile(f.name, buf, f); setView("timeline"); setFocus(E.focus); bump(); toast("Added melody: " + f.name, h(I.Wave, { width: 16, height: 16 })); }, function () { toast("Could not decode " + f.name, h(I.X, null)); }); }); }); }
+    function studioMelodyMaker() { pickFiles("audio/*", false, function (files) { var f = files[0]; E.decodeAudioFile(f, function (buf) { var d = E.addPolySamplerTrack(f.name, buf, f); setView("timeline"); setFocus(E.focus); E.setFocus(E.focus); lastTonal.current = d.id; bump(); toast("Melody Maker: " + d.label, h(I.Note, { width: 16, height: 16 })); }, function () { toast("Could not decode " + f.name, h(I.X, null)); }); }); }
+    function addAudioLaneTrack() { var d = E.addAudioTrack(); setStudioSel(d.id); setStudioArm(d.id); setFocus(E.focus); E.setFocus(E.focus); bump(); toast("Added " + d.label + " — armed", h(I.Plus, { width: 16, height: 16 })); }
+    function recordStub() { toast("Capture coming in Sprint B — arm + transport wiring is live now", h(I.Mic, { width: 16, height: 16 })); }
+    function linkFolderFromStudio() { setStudio(false); setRailCol(false); toast("Link folders from the Producer library (sidebar)", h(I.Folder, { width: 16, height: 16 })); }
+
+    // ---- Studio Restructure handlers -------------------------------------------
+    // context-change audio safety: stop scoped voices synchronously BEFORE any UI state change.
+    function studioStop() { try { E.scope.stopScopeVoices(); } catch (e) {} }
+    // Manual track selection (dropdown/lane/track row) — one-way precedence: disables Follow-Armed.
+    function selectStudioTrack(id, manual) { studioStop(); if (manual) setFollowArmed(false); setStudioSel(id); doFocus(id); }
+    // Arm a lane. Backing tracks can't be armed. When Follow-Armed is on, the Plugins panel snaps to it.
+    function armStudioTrack(id) {
+      studioStop();
+      var d = id ? (E.channels[id] && E.channels[id].def) : null;
+      if (d && isBackingDef(d)) { toast("Backing track is read-only", h(I.X, null)); return; }
+      setStudioArm(id);
+      if (id && followArmed) { setStudioSel(id); doFocus(id); }
+    }
+    // [M] mute — de-click gain ramp (never a hard cut); toggles def.uiMuted; works on all tracks.
+    function toggleStudioMute(id) {
+      studioStop();
+      var ch = E.channels[id]; if (!ch) return;
+      var d = ch.def; d.uiMuted = !d.uiMuted;
+      try { var t = E.ctx.currentTime; ch.gain.gain.cancelScheduledValues(t); ch.gain.gain.setTargetAtTime(d.uiMuted ? 0.0001 : (ch.vol || d.vol || 0.9), t, 0.01); } catch (e) {}
+      bump();
+    }
+    // [✕] delete — confirmation modal, then ONE atomic synchronous sequence (no intermediate renders).
+    function requestDeleteStudioTrack(id) {
+      var ch = E.channels[id]; if (!ch) return;
+      if (isBackingDef(ch.def)) return;                 // delete hidden/blocked on backing
+      setDelConfirm({ id: id, label: ch.def.label });
+    }
+    function confirmDeleteStudioTrack() {
+      var pending = delConfirm; if (!pending) return;
+      var id = pending.id, ch = E.channels[id]; if (!ch) { setDelConfirm(null); return; }
+      var label = ch.def.label;
+      studioStop();                                     // 1) stop scoped voices + de-click
+      if (studioArm === id) setStudioArm(null);         // 2) disarm if armed
+      // 3) compute the next selection BEFORE removal (next editable track, else null)
+      var remaining = studioTracks(E.channelDefs).filter(function (c) { return c.id !== id; });
+      var nextEditable = remaining.filter(function (c) { return !isBackingDef(c); })[0] || remaining[0];
+      var nextSel = nextEditable ? nextEditable.id : null;
+      // 4) SOFT delete — capture {def, clips, buffers} to the session recycle buffer, then detach.
+      var clips = E.timeline.clips.filter(function (cl) { return cl.ch === id; });
+      var buffers = {}; clips.forEach(function (c) { if (c.bufferId && E.userBuffers[c.bufferId]) buffers[c.bufferId] = E.userBuffers[c.bufferId]; });
+      ch.def.deletedAt = Date.now();
+      recycleRef.current.push({ def: ch.def, clips: clips.map(function (c) { return JSON.parse(JSON.stringify(c)); }), buffers: buffers });
+      E.removeChannel(id);                              // engine keeps userBuffers in memory
+      E.timeline.clips = E.timeline.clips.filter(function (cl) { return cl.ch !== id; });
+      if (lastTonal.current === id) lastTonal.current = null;
+      // 5) single UI commit
+      setFollowArmed(false); setStudioSel(nextSel); setFocus(E.focus); E.setFocus(E.focus);
+      setDelConfirm(null); bump();
+      toast(label + " deleted · Ctrl+Z to undo", h(I.Trash, { width: 16, height: 16 }));
+    }
+    // Undo the last soft-delete — reattach the track (new lane), restore its buffers + clips + model.
+    function studioUndo() {
+      var rec = recycleRef.current.pop(); if (!rec) { toast("Nothing to undo", h(I.Reset, null)); return; }
+      studioStop();
+      var od = rec.def;
+      var nd = E.addAudioTrack(od.label);               // fresh lane: bank rows + wired nodes + id
+      nd.trackType = od.trackType; nd.pluginState = od.pluginState; nd.meta = od.meta;
+      nd.backing = od.backing; nd.locked = od.locked; nd.uiMuted = od.uiMuted; nd.deletedAt = null;
+      if (od.color) nd.color = od.color;
+      rec.clips.forEach(function (c) {
+        if (c.bufferId && rec.buffers[c.bufferId]) E.userBuffers[c.bufferId] = rec.buffers[c.bufferId];
+        var nc = JSON.parse(JSON.stringify(c)); nc.ch = nd.id; E.timeline.clips.push(nc);
+      });
+      E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
+      setStudioSel(nd.id); setFocus(E.focus); E.setFocus(E.focus); bump();
+      toast("Restored " + nd.label, h(I.Reset, { width: 16, height: 16 }));
+    }
     // ---- project controls (Phase 1: New / Slots / Export-Import) ----
     var SLOT_IDX = "chefs_project_slots", SLOT_PREFIX = "chefs_slot:";
     var slS = useState(function () { try { return JSON.parse(localStorage.getItem(SLOT_IDX) || "[]"); } catch (e) { return []; } });
@@ -643,9 +977,57 @@
     function refreshSlots() { try { setSlots(JSON.parse(localStorage.getItem(SLOT_IDX) || "[]")); } catch (e) { setSlots([]); } }
     function syncFromEngine() { setBpm(E.tempo); setSwing(E.swing); setMaster(E.master ? E.master.gain.value : 0.9); setActive(E.activePattern); setFocus(E.focus); }
     function newProject() { E.newProject(); try { localStorage.removeItem("chefs_studio_session"); } catch (e) {} syncFromEngine(); setView("timeline"); bump(); toast("New clean project", h(I.Reset, { width: 16, height: 16 })); }
+    // ---- dual master export (WAV download; no track insertion) ----
+    function dlBlob(blob, name) { var u = URL.createObjectURL(blob); var a = document.createElement("a"); a.href = u; a.download = name; document.body.appendChild(a); a.click(); setTimeout(function () { URL.revokeObjectURL(u); a.remove(); }, 800); }
+    // Producer master = renderMixdown (arrangement bounce) → WAV. Does NOT insert a track.
+    function exportProducerMaster() {
+      if (exporting) return;
+      try { E.scope.stopScopeVoices(); } catch (e) {}
+      if (E.isPlaying) { E.pause(); setPlaying(false); setPlayStep(-1); }
+      setExporting("producer"); setExportProg(0);
+      E.renderMixdown(function (p) { setExportProg(p); }, function (blob) {
+        setExporting(null); setExportProg(0);
+        if (!blob) { toast("Producer master failed", h(I.X, null)); return; }
+        dlBlob(blob, "chefs-remix-producer-master.wav"); toast("Producer master · chefs-remix-producer-master.wav", h(I.Check, null));
+      });
+    }
+    // Rec Audio master = offline render of backing + unmuted audio lanes through their plugin chains → WAV.
+    function exportRecAudioMaster() {
+      if (exporting) return;
+      try { E.scope.stopScopeVoices(); } catch (e) {}
+      if (E.isPlaying) { E.pause(); setPlaying(false); setPlayStep(-1); }
+      setExporting("recaudio"); setExportProg(0);
+      E.renderRecAudioMaster(function (p) { setExportProg(p); }, function (blob) {
+        setExporting(null); setExportProg(0);
+        if (!blob) { toast("Nothing to mix yet", h(I.X, null)); return; }
+        dlBlob(blob, "chefs-remix-recaudio-master.wav"); toast("Rec Audio master · chefs-remix-recaudio-master.wav", h(I.Check, null));
+      });
+    }
+    // Phase 7: serialize the session Studio pluginState (+ muted, trackType) alongside the engine
+    // project on EXPLICIT save only. Autosave (scheduleSave) stays untouched → no reload persistence.
+    function serializeWithStudio() {
+      var data = E.serialize(); data.studio = {};
+      E.channelDefs.forEach(function (c) {
+        if ((c.type === "audio" || c.kind === "audioLane") && c.pluginState) data.studio[c.id] = { pluginState: c.pluginState, muted: !!c.uiMuted, trackType: c.trackType };
+      });
+      return data;
+    }
+    // restore Studio state onto matching defs after a hydrate; re-apply to live nodes.
+    function restoreStudioSave(data) {
+      if (!data || !data.studio) return;
+      Object.keys(data.studio).forEach(function (id) {
+        var ch = E.channels[id]; if (!ch) return; var s = data.studio[id];
+        ensureStudioModel(ch.def);
+        if (s.pluginState) ch.def.pluginState = s.pluginState;
+        if (s.trackType) { ch.def.trackType = s.trackType; if (s.trackType === "backing") { ch.def.backing = true; ch.def.locked = true; } }
+        ch.def.uiMuted = !!s.muted;
+        try { if (window.__studioApply) window.__studioApply(ch.def); } catch (e) {}
+        if (ch.def.uiMuted) { try { ch.gain.gain.setTargetAtTime(0.0001, E.ctx.currentTime, 0.01); } catch (e2) {} }
+      });
+    }
     function exportProject() {
       try {
-        var blob = new Blob([JSON.stringify(E.serialize())], { type: "application/json" });
+        var blob = new Blob([JSON.stringify(serializeWithStudio())], { type: "application/json" });
         var url = URL.createObjectURL(blob), a = document.createElement("a");
         a.href = url; a.download = "chefs-remix-project.json"; document.body.appendChild(a); a.click(); a.remove();
         setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
@@ -654,12 +1036,12 @@
     }
     function importProjectFile(file) {
       var fr = new FileReader();
-      fr.onload = function () { try { var data = JSON.parse(fr.result); if (E.hydrate(data)) { syncFromEngine(); bump(); toast("Project imported", h(I.Check, { width: 16, height: 16 })); } else toast("Incompatible project file", h(I.X, null)); } catch (e) { toast("Invalid project file", h(I.X, null)); } };
+      fr.onload = function () { try { var data = JSON.parse(fr.result); if (E.hydrate(data)) { restoreStudioSave(data); syncFromEngine(); bump(); toast("Project imported", h(I.Check, { width: 16, height: 16 })); } else toast("Incompatible project file", h(I.X, null)); } catch (e) { toast("Invalid project file", h(I.X, null)); } };
       fr.onerror = function () { toast("Couldn't read file", h(I.X, null)); };
       fr.readAsText(file);
     }
-    function saveSlot(nm2) { try { localStorage.setItem(SLOT_PREFIX + nm2, JSON.stringify(E.serialize())); var idx = JSON.parse(localStorage.getItem(SLOT_IDX) || "[]"); if (idx.indexOf(nm2) < 0) idx.push(nm2); localStorage.setItem(SLOT_IDX, JSON.stringify(idx)); setSlots(idx); toast("Saved “" + nm2 + "”", h(I.Check, { width: 16, height: 16 })); } catch (e) { toast("Slot save failed (storage full?)", h(I.X, null)); } }
-    function loadSlot(nm2) { try { var raw = localStorage.getItem(SLOT_PREFIX + nm2); if (raw && E.hydrate(JSON.parse(raw))) { syncFromEngine(); bump(); toast("Loaded “" + nm2 + "”", h(I.Check, { width: 16, height: 16 })); } else toast("Slot unreadable", h(I.X, null)); } catch (e) { toast("Load failed", h(I.X, null)); } }
+    function saveSlot(nm2) { try { localStorage.setItem(SLOT_PREFIX + nm2, JSON.stringify(serializeWithStudio())); var idx = JSON.parse(localStorage.getItem(SLOT_IDX) || "[]"); if (idx.indexOf(nm2) < 0) idx.push(nm2); localStorage.setItem(SLOT_IDX, JSON.stringify(idx)); setSlots(idx); toast("Saved “" + nm2 + "”", h(I.Check, { width: 16, height: 16 })); } catch (e) { toast("Slot save failed (storage full?)", h(I.X, null)); } }
+    function loadSlot(nm2) { try { var raw = localStorage.getItem(SLOT_PREFIX + nm2); if (raw) { var data = JSON.parse(raw); if (E.hydrate(data)) { restoreStudioSave(data); syncFromEngine(); bump(); toast("Loaded “" + nm2 + "”", h(I.Check, { width: 16, height: 16 })); } else toast("Slot unreadable", h(I.X, null)); } else toast("Slot unreadable", h(I.X, null)); } catch (e) { toast("Load failed", h(I.X, null)); } }
     function deleteSlot(nm2) { try { localStorage.removeItem(SLOT_PREFIX + nm2); var idx = JSON.parse(localStorage.getItem(SLOT_IDX) || "[]").filter(function (n) { return n !== nm2; }); localStorage.setItem(SLOT_IDX, JSON.stringify(idx)); setSlots(idx); } catch (e) {} }
 
     // derived state
@@ -667,6 +1049,9 @@
     var litMap = {}; if (playing && playStep >= 0 && mode === "pattern") { E.channelDefs.forEach(function (c) { litMap[c.id] = E.banks[active].steps[c.id][playStep].on; }); }
     var routeCount = {}; E.channelDefs.forEach(function (c) { routeCount[c.route] = (routeCount[c.route] || 0) + 1; });
     var insertState = E.insertDefs.map(function (d) { var ins = E.inserts[d.id]; return { id: d.id, name: d.name, vol: ins.vol, pan: ins.panVal, mute: ins.mute, solo: ins.solo, micOn: !!ins.micOn, fx: ins.fx.map(function (s) { return { type: s.type, bypass: s.bypass }; }), routeCount: routeCount[d.id] || 0 }; });
+
+    // Rec Audio master availability: any unmuted audio lane with an audio clip (backing counts).
+    var recAudioAvailable = E.channelDefs.some(function (c) { return (c.type === "audio" || c.kind === "audioLane") && !c.uiMuted && E.timeline.clips.some(function (cl) { return cl.ch === c.id && cl.kind === "audio"; }); });
 
     var focusCh = (focus && E.channels[focus]) ? E.channels[focus].def : null;
     var prCh = focusCh && focusCh.tonal ? focusCh
@@ -695,10 +1080,18 @@
     var TABS = [{ id: "timeline", label: "Timeline", ic: I.Timeline }];
     var editingClip = (editClip && E.timeline.clips.indexOf(editClip) >= 0) ? editClip : null;   // guard against deleted/undone clips
 
+    // live mirror for the global key handler (Studio M/Del/R/Ctrl+Z shortcuts)
+    studioKbdRef.current = { studio: studio, sel: studioSel, arm: studioArm, mute: toggleStudioMute, del: requestDeleteStudioTrack, armfn: armStudioTrack, undo: studioUndo };
+    E._recMode = studio;   // mode-scoped playback filter (Producer=false, Rec Audio=true)
+
     return h(React.Fragment, null,
       h("div", { className: "stage" },
-        h(Transport, { playing: playing, bpm: bpm, swing: swing, master: master, active: active, pos: posStr(playStep, playBar, mode), onPlay: togglePlay, onStop: stop, onBpm: function (v) { E.setTempo(v); setBpm(v); }, onSwing: function (v) { E.setSwing(v); setSwing(v); }, onPattern: pattern, onExport: function () { setShowEx(true); } }),
-        h("div", { className: "workspace" },
+        h(Transport, { playing: playing, bpm: bpm, swing: swing, master: master, active: active, pos: posStr(playStep, playBar, mode), studio: studio, onToggleStudio: toggleStudio, onPlay: togglePlay, onStop: stop, onBpm: function (v) { E.setTempo(v); setBpm(v); }, onSwing: function (v) { E.setSwing(v); setSwing(v); }, onPattern: pattern, onProducerMaster: exportProducerMaster, onRecAudioMaster: exportRecAudioMaster, exporting: exporting, exportProg: exportProg, recAvailable: recAudioAvailable }),
+        studio
+          ? h(StudioMode, { channelDefs: E.channelDefs, bpm: bpm, playing: playing, playTick: playTick, rev: rev, triplet: triplet, selected: studioSel, armed: studioArm, followArmed: followArmed, bouncing: bouncing, bounceProg: bounceProg, commit: bump, onPlay: togglePlay, onStop: stop,
+              onSelect: selectStudioTrack, onArm: armStudioTrack, onAddTrack: addAudioLaneTrack, onRecord: recordStub, onToggleFollow: function () { setFollowArmed(function (v) { var nx = !v; if (nx && studioArm) { setStudioSel(studioArm); doFocus(studioArm); } return nx; }); },
+              onMute: toggleStudioMute, onDelete: requestDeleteStudioTrack, onReplace: replaceBacking, onBounce: bounceCurrent, onUpload: uploadBacking })
+          : h("div", { className: "workspace" },
           h(window.FileBrowser, { collapsed: railCol, onCollapse: function () { setRailCol(!railCol); }, channelDefs: E.channelDefs, focus: focus, onFocus: doFocus, onPreview: previewSample, onAssign: assignSample, onCreateTrack: createTrackFromSample, toast: toast, onTrackAdded: function () { setFocus(E.focus); E.setFocus(E.focus); bump(); },
             onAddMelody: function (files) {
               // Fix 1: decode each melody file -> full-length Audio Lane clip on the timeline.
@@ -772,6 +1165,13 @@
           onClose: function () { setDualClip(null); } }) : null,
         fxModal ? h(FXModal, { id: fxModal.id, slot: fxModal.slot, clip: fxModal.clip, onClose: function () { setFxModal(null); }, commit: bump }) : null,
         showEx ? h(RenderModal, { onClose: function () { setShowEx(false); }, onStopped: function () { setPlaying(false); setPlayStep(-1); }, toast: toast }) : null,
+        delConfirm ? h("div", { className: "modal-scrim", onClick: function () { setDelConfirm(null); } },
+          h("div", { className: "confirm-modal", onClick: function (e) { e.stopPropagation(); } },
+            h("div", { className: "cm-ttl" }, "Delete track “" + delConfirm.label + "”?"),
+            h("div", { className: "cm-body" }, "This will remove the track and its audio from the session. This action can be undone while the session is open."),
+            h("div", { className: "cm-acts" },
+              h("button", { className: "cm-btn", onClick: function () { setDelConfirm(null); } }, "Cancel"),
+              h("button", { className: "cm-btn danger", onClick: confirmDeleteStudioTrack }, "Delete")))) : null,
         h("div", { className: "toast-wrap" }, toasts.map(function (x) { return h("div", { className: "toast", key: x.id }, h("span", { className: "ti" }, x.ic), x.m); }))),
       h(window.TweaksPanel, null,
         h(window.TweakSection, { label: "Workspace Density" }),

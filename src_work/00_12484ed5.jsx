@@ -1131,8 +1131,21 @@
     g.connect(ins.input);
     return g;
   };
+  // Mode-scoped audibility (Layout/Scoped delta): ONE shared clock; the scheduler only SOUNDS the
+  // active tab's channel set. Producer → everything except backing (steps/synth/polySampler/samplers/
+  // melody audio lanes). Rec Audio → backing/Project + audio lanes only. uiMuted tracks excluded.
+  // Set `engine._recMode` from the App (false = Producer, true = Rec Audio). Never forks the transport.
+  Engine.prototype._inModeScope = function (id) {
+    var ch = this.channels[id]; if (!ch) return true; var d = ch.def; if (!d) return true;
+    if (d.uiMuted) return false;                                   // muted tracks stay excluded
+    var backing = d.trackType === "backing" || d.backing || d.locked;
+    var audioLane = d.type === "audio" || d.kind === "audioLane";
+    if (this._recMode) return backing || audioLane;               // Rec Audio: backing + audio lanes
+    return !backing;                                              // Producer: all non-backing content
+  };
   Engine.prototype._fireEvent = function (ev, time) {
     if (!this._audible(ev.ch)) return;
+    if (!this._inModeScope(ev.ch)) return;                        // mode-scoped: only the active tab's content sounds
     var ch = this.channels[ev.ch]; if (!ch) return;
     var send = this._overrideSend(ch, ev.routeOverride);   // null unless the clip overrides its route
     if (ev.kind === "audio") {
@@ -1401,6 +1414,68 @@
     var target = this._insertInput(c.route, c.id);
     if (p) { p.pan.value = c.pan; g.connect(p); p.connect(target); } else g.connect(target);
     this.channels[c.id] = { def: c, gain: g, panner: p, vol: c.vol, pan: c.pan, muted: false, solo: false, route: c.route };
+  };
+
+  // ---- Studio Mode (Build 1): additive per-channel DSP ----------------------
+  // NONE of this touches the scheduler / voice / scope core. It only ADDS signal-
+  // routing nodes, spliced with the same disconnect->reconnect idiom setRoute uses.
+  //
+  // Synthesize a decaying-noise stereo impulse response for the ConvolverNode reverb.
+  // `seconds` ~ perceived room size; `decay` shapes the tail (higher = shorter).
+  Engine.prototype._makeImpulse = function (seconds, decay) {
+    this.init(); var ctx = this.ctx, rate = ctx.sampleRate;
+    var len = Math.max(1, Math.floor(rate * (seconds || 2)));
+    var ir = ctx.createBuffer(2, len, rate), dk = (decay == null ? 2.5 : decay);
+    for (var c = 0; c < 2; c++) {
+      var ch = ir.getChannelData(c);
+      for (var i = 0; i < len; i++) ch[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, dk);
+    }
+    return ir;
+  };
+  // Idempotent per-channel Studio DSP handle. Builds ONLY the nodes the insert lacks
+  // (3-band EQ: lowshelf/peaking/highshelf, + a ConvolverNode reverb with dry/wet sends)
+  // and SPLICES them between the channel's output tail and its insert input using the
+  // exact disconnect->reconnect pattern from setRoute (proven-safe, no graph corruption).
+  // Input Gain -> channels[id].gain, Cutoff -> inserts[route].filt, Comp -> inserts[route].comp,
+  // Delay -> inserts[route].delay/fb/wet are wired to the EXISTING nodes (no new graph), so the
+  // DJ strip's real controls all act on live Web Audio nodes.
+  Engine.prototype.studioFx = function (chId) {
+    this.init(); var ch = this.channels[chId]; if (!ch) return null;
+    if (ch._studio) return ch._studio;
+    var ctx = this.ctx;
+    // baked 80 Hz high-pass (always on — removes sub-rumble from tracked audio; UI shows "HPF 80Hz")
+    var hpf = ctx.createBiquadFilter(); hpf.type = "highpass"; hpf.frequency.value = 80; hpf.Q.value = 0.7;
+    var low = ctx.createBiquadFilter(); low.type = "lowshelf"; low.frequency.value = 120; low.gain.value = 0;
+    var mid = ctx.createBiquadFilter(); mid.type = "peaking"; mid.frequency.value = 1000; mid.Q.value = 0.9; mid.gain.value = 0;
+    var high = ctx.createBiquadFilter(); high.type = "highshelf"; high.frequency.value = 6000; high.gain.value = 0;
+    var conv = ctx.createConvolver(); conv.buffer = this._makeImpulse(2.4, 2.6);
+    var wet = ctx.createGain(); wet.gain.value = 0;
+    var dry = ctx.createGain(); dry.gain.value = 1;
+    var out = ctx.createGain(); out.gain.value = 1;
+    // hpf -> low -> mid -> high -> (dry + conv->wet) -> out
+    hpf.connect(low); low.connect(mid); mid.connect(high);
+    high.connect(dry); high.connect(conv); conv.connect(wet);
+    dry.connect(out); wet.connect(out);
+    // splice the channel tail (panner if present, else gain) through the chain into the insert
+    var tail = ch.panner || ch.gain, tgt = this._insertInput(ch.route, chId);
+    try { tail.disconnect(); } catch (e) {}
+    tail.connect(hpf); out.connect(tgt);
+    ch._studio = { hpf: hpf, low: low, mid: mid, high: high, conv: conv, wet: wet, dry: dry, out: out };
+    return ch._studio;
+  };
+  // Set reverb "size" by regenerating the impulse (call sparingly, e.g. on pointer-up).
+  Engine.prototype.setStudioReverbSize = function (chId, seconds) {
+    var ch = this.channels[chId]; if (!ch || !ch._studio) return;
+    ch._studio.conv.buffer = this._makeImpulse(Math.max(0.2, seconds || 2.4), 2.6);
+  };
+  // Coarse 0..1 output level from the channel's insert analyser (Studio VU convenience).
+  Engine.prototype.channelLevel = function (chId) {
+    var ch = this.channels[chId]; if (!ch) return 0;
+    var ins = this.inserts[ch.route]; if (!ins || !ins.analyser) return 0;
+    var d = ins.meterData || new Uint8Array(ins.analyser.fftSize);
+    ins.analyser.getByteFrequencyData(d);
+    var s = 0; for (var i = 0; i < d.length; i++) s += d[i];
+    return Math.min(1, (s / d.length) / 160);
   };
 
   // append a new track from a catalog voice type; allocate route = max(route)+1 (NOT length)
@@ -1734,6 +1809,62 @@
     var chans = []; for (var c = 0; c < nc; c++) chans.push(buffer.getChannelData(c));
     for (var i = 0; i < len; i++) for (var c = 0; c < nc; c++) { var s = Math.max(-1, Math.min(1, chans[c][i])); v.setInt16(pos, s < 0 ? s * 0x8000 : s * 0x7FFF, true); pos += 2; }
     return new Blob([ab], { type: "audio/wav" });
+  };
+
+  // ---- Rec Audio master (dual-export): offline-render the Studio session — backing/Project +
+  // every UNMUTED audio lane — each through its session studio plugin chain (real: input gain,
+  // baked 80Hz HPF + 3-band EQ, cutoff, compressor, tempo-delay, convolver reverb; stubbed DSP
+  // passes through cleanly). Muted lanes excluded. Reads def.pluginState (the UI model on the def;
+  // safe defaults if absent). Mirrors renderMixdown's master chain + tail sizing + _encodeWav.
+  Engine.prototype.renderRecAudioMaster = function (onProgress, onDone) {
+    var self = this; this.init();
+    var sr = (this.ctx && this.ctx.sampleRate) ? this.ctx.sampleRate : 44100;
+    var bpm = this.tempo || 140, spb = 60 / Math.max(40, bpm);
+    var lanes = this.channelDefs.filter(function (c) { return (c.type === "audio" || c.kind === "audioLane") && !c.uiMuted; });
+    var clipsByLane = {}, songTicks = 0, maxDelayTail = 0, any = false;
+    lanes.forEach(function (c) {
+      var cl = self.timeline.clips.filter(function (x) { return x.ch === c.id && x.kind === "audio"; });
+      clipsByLane[c.id] = cl;
+      cl.forEach(function (x) { var e = (x.startTick || 0) + (x.lengthTicks || 0); if (e > songTicks) songTicks = e; any = true; });
+      var ps = c.pluginState; if (ps && ps.delay && ps.delay.mix > 0.001) { var t = ps.delay.div === "1/4" ? spb : ps.delay.div === "1/8" ? spb / 2 : spb / 4; var fb = Math.min(0.95, ps.delay.fb || 0); var reps = fb > 0.01 ? 3 / Math.log10(1 / fb) : 1; var tl = t * reps; if (tl > maxDelayTail) maxDelayTail = tl; }
+    });
+    if (!any) { onDone && onDone(null); return; }
+    var dur = this.tickToSec(songTicks) + Math.min(12, Math.max(1.8, maxDelayTail + 0.3));
+    var OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OAC) { onDone && onDone(null); return; }
+    var octx = new OAC(2, Math.ceil(sr * dur), sr);
+    var master = octx.createGain(); master.gain.value = this.master.gain.value;
+    var softclip = octx.createWaveShaper(); softclip.curve = this._softClipCurve(); softclip.oversample = "4x";
+    var lim = octx.createDynamicsCompressor(); lim.threshold.value = -2; lim.knee.value = 0; lim.ratio.value = 20; lim.attack.value = 0.002; lim.release.value = 0.12;
+    master.connect(softclip); softclip.connect(lim); lim.connect(octx.destination);
+    lanes.forEach(function (c) {
+      var ps = c.pluginState || {}, eq = ps.eq || {}, comp = ps.compressor || {}, dly = ps.delay || {}, rev = ps.reverb || {};
+      var inGain = ps.inputGain != null ? ps.inputGain : (self.channels[c.id] ? self.channels[c.id].vol : 0.9);
+      var chan = octx.createGain(); chan.gain.value = inGain;
+      var hpf = octx.createBiquadFilter(); hpf.type = "highpass"; hpf.frequency.value = 80; hpf.Q.value = 0.7;
+      var low = octx.createBiquadFilter(); low.type = "lowshelf"; low.frequency.value = 120; low.gain.value = eq.low || 0;
+      var mid = octx.createBiquadFilter(); mid.type = "peaking"; mid.frequency.value = 1000; mid.Q.value = 0.9; mid.gain.value = eq.mid || 0;
+      var high = octx.createBiquadFilter(); high.type = "highshelf"; high.frequency.value = 6000; high.gain.value = eq.high || 0;
+      var conv = octx.createConvolver(); conv.buffer = self._makeImpulse(rev.size || 2.4, 2.6);
+      var rdry = octx.createGain(); rdry.gain.value = 1; var rwet = octx.createGain(); rwet.gain.value = rev.wet || 0; var rsum = octx.createGain();
+      var filt = octx.createBiquadFilter(); filt.type = "lowpass"; filt.frequency.value = eq.cutoff != null ? eq.cutoff : 20000; filt.Q.value = 0.7;
+      var cmp = octx.createDynamicsCompressor(); cmp.attack.value = 0.005; cmp.release.value = 0.15; cmp.threshold.value = comp.threshold != null ? comp.threshold : 0; cmp.ratio.value = comp.ratio != null ? comp.ratio : 1;
+      var ddry = octx.createGain(); ddry.gain.value = 1; var dl = octx.createDelay(1.5); var dfb = octx.createGain(); var dwet = octx.createGain();
+      var dsec = dly.div === "1/4" ? spb : dly.div === "1/8" ? spb / 2 : spb / 4; dl.delayTime.value = Math.min(1.5, dsec); dfb.gain.value = Math.min(0.95, dly.fb || 0); dwet.gain.value = dly.mix || 0;
+      var fader = octx.createGain(); fader.gain.value = (ps.routing && ps.routing.output != null) ? ps.routing.output : (self.inserts[c.route] ? self.inserts[c.route].vol : 0.8);
+      chan.connect(hpf); hpf.connect(low); low.connect(mid); mid.connect(high);
+      high.connect(rdry); high.connect(conv); conv.connect(rwet); rdry.connect(rsum); rwet.connect(rsum);
+      rsum.connect(filt); filt.connect(cmp);
+      cmp.connect(ddry); cmp.connect(dl); dl.connect(dfb); dfb.connect(dl); dl.connect(dwet);
+      ddry.connect(fader); dwet.connect(fader); fader.connect(master);
+      (clipsByLane[c.id] || []).forEach(function (clip) {
+        var adur = clip.trimmed ? self.tickToSec(clip.lengthTicks) : 0;
+        self._playBuffer(octx, self.userBuffers[clip.bufferId], self.tickToSec(clip.startTick || 0), chan, 0, 100, adur, self.tickToSec(clip.offsetTicks || 0), { gain: clip.gain, fadeIn: self.tickToSec(clip.fadeInTicks || 0), fadeOut: self.tickToSec(clip.fadeOutTicks || 0) });
+      });
+    });
+    var t0 = Date.now(), est = Math.max(2500, dur * 240);
+    var prog = setInterval(function () { var el = Date.now() - t0; onProgress && onProgress(Math.min(0.985, 1 - Math.exp(-el / est * 2.2))); }, 60);
+    octx.startRendering().then(function (rendered) { clearInterval(prog); onProgress && onProgress(1); onDone && onDone(self._encodeWav(rendered)); }).catch(function (e) { clearInterval(prog); console.error(e); onDone && onDone(null); });
   };
 
   // ---- multitrack stem export: render each lane solo, package as a (store) ZIP ----
