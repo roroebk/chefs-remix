@@ -116,6 +116,7 @@
     this._recState = null; this._recSeq = 0;                                // continuous timeline audio recording (MediaRecorder path)
     this._micStream = null; this._cap = null;                               // Sprint B: cached mic stream + live PCM capture state
     this._monitorOn = false;                                                // Rec-Audio enhancement: input-monitoring toggle (session state, defaults OFF)
+    this._recCalibMs = 0;                                                   // Fix A: per-session recording-latency calibration (ms, default 0, additive)
     this._perfArmed = false; this._perfClips = {}; this._openNotes = {}; this._midiOn = false;  // MIDI/keyboard performance
     this._hist = { stack: [], idx: -1, lastJSON: null };                    // undo/redo snapshot history
     // arrangement (legacy pattern/bank model — still authoritative until the timeline is wired in)
@@ -851,8 +852,13 @@
       self._micStream = stream;
       var track = stream.getAudioTracks()[0];
       var settings = (track && track.getSettings) ? track.getSettings() : {};
-      var latency = (self.ctx.baseLatency || 0) + (typeof settings.latency === "number" ? settings.latency : 0);
-      if (!latency) latency = 0.012;                          // measured/config default when the UA hides track latency
+      // Fix A (alignment) — CAPTURE-SIDE latency ONLY. `baseLatency` is an OUTPUT-path delay; on playback
+      // it delays the backing AND the take equally (common-mode), so folding it into the clip-placement
+      // shift OVER-compensates and the take plays EARLY (the reported symptom). Compensate only the input/
+      // capture-path delay — the amount by which a mic sample's audio-clock label lags the moment the sound
+      // physically occurred. Browser-reported input latency is unreliable across devices, so a per-session
+      // calibration offset (setRecCalib, ms) is ADDED to this at clip placement to trim the residual by ear.
+      var latency = (typeof settings.latency === "number" && settings.latency > 0) ? settings.latency : 0.012;
       var src = self.ctx.createMediaStreamSource(stream);
       var silent = self.ctx.createGain(); silent.gain.value = 0; silent.connect(self.master);   // capture path sink: 0 gain => the CAPTURE branch never monitors
       // input MONITORING = a PARALLEL tap off the raw input source, PRE-capture-buffer (the capture node
@@ -961,6 +967,13 @@
     if (c && c.monGain) { var t = this.ctx.currentTime; c.monGain.gain.cancelScheduledValues(t); c.monGain.gain.setTargetAtTime(on ? 1 : 0, t, 0.008); }
   };
   Engine.prototype.isMonitorOn = function () { return !!this._monitorOn; };
+  // Fix A (alignment) — per-session recording latency calibration (ms, default 0). ADDED to the measured
+  // capture-side latency at clip placement (positive = shift the take EARLIER / more compensation, negative
+  // = LATER / less). Exists because browser-reported latency is unreliable; the manual test script tunes it
+  // by ear per device (record a click against the backing click, measure the gap in the WaveEditor, set this).
+  Engine.prototype.setRecCalib = function (ms) { ms = +ms; this._recCalibMs = isFinite(ms) ? ms : 0; };
+  Engine.prototype.getRecCalib = function () { return this._recCalibMs || 0; };
+  Engine.prototype.recCalibSec = function () { return (this._recCalibMs || 0) / 1000; };
   // release the cached mic stream + capture nodes (session end / teardown)
   Engine.prototype.releaseMic = function () {
     var c = this._cap;

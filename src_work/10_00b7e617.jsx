@@ -642,7 +642,8 @@
         h("span", { className: "pt" }, "Audio Tracking"),
         h("span", { className: "sub" }, "Drag the red line to set punch-in · select a track, then RECORD · " + lanes.length + " lane" + (lanes.length === 1 ? "" : "s")),
         h("button", { className: "sm-addtrack", onClick: props.onAddTrack }, h(I.Plus, { width: 14, height: 14 }), "Add Track")),
-      h("div", { className: "sm-lanes", ref: lanesRef, onMouseDown: function (e) { if (e.target.classList.contains("sm-lanes")) props.onSelectClip(null); } },
+      h("div", { className: "sm-lanes", ref: lanesRef, onContextMenu: function (e) { e.preventDefault(); },
+          onMouseDown: function (e) { if (e.button === 0 && e.target.classList.contains("sm-lanes")) props.onSelectClip(null); } },
         showPurple ? h("div", { className: "sm-playhead play", style: phLeft(props.playTick / fit), title: "Playback position — drag to scrub",
           onMouseDown: function (e) { props.dragScrub(e, function (ev) { return laneFrac(ev.clientX); }); } }) : null,
         h("div", { className: "sm-playhead rec" + (redDraggable ? " grab" : ""), style: phLeft(redTick / fit),
@@ -654,6 +655,7 @@
               var backing = isBackingDef(c);
               var muted = !!c.uiMuted;
               var live = props.recPreview && props.recPreview.ch === c.id ? props.recPreview : null;
+              var rs = props.rangeSel; var rng = (rs && rs.ch === c.id && rs.endTick > rs.startTick) ? rs : null;   // Fix B: this lane's active range
               return h("div", { key: c.id, className: "sm-lane" + (props.selected === c.id ? " sel" : "") + (backing ? " locked" : "") + (muted ? " muted" : ""), onClick: function () { props.onSelect(c.id, true); }, onDoubleClick: function () { if (clips[0] && !backing && props.onOpenTake) props.onOpenTake(clips[0]); } },
                 h("div", { className: "sm-lanehead" },
                   h("span", { className: "sm-dot", style: { background: c.color || "var(--accent)" } }),
@@ -664,7 +666,12 @@
                     : (props.selected === c.id ? h("span", { className: "sm-badge sel", title: "Selected — the RECORD target" }, "REC TARGET") : null)),
                 // auto-fit lane body: every clip is time-positioned by the SHARED scale (left/width = % of
                 // fitTicks), so a given x = the same timestamp on every lane. No horizontal overflow.
-                h("div", { className: "sm-lanebody" + ((clips.length || live) ? "" : " empty"), onClick: function (e) { if (!clips.length && !live && !backing) { e.stopPropagation(); props.onSelect(c.id, true); } } },
+                h("div", { className: "sm-lanebody" + ((clips.length || live) ? "" : " empty") + (rng ? " ranging" : ""),
+                    // Fix B — right-drag anywhere on a (non-backing) lane body selects a snapped TIME RANGE
+                    // on THAT lane; onContextMenu is suppressed so the browser menu never eats the gesture.
+                    onMouseDown: backing ? null : function (e) { if (e.button === 2) { e.preventDefault(); props.onRangeDown(e, c.id); } },
+                    onContextMenu: backing ? null : function (e) { e.preventDefault(); },
+                    onClick: function (e) { if (!clips.length && !live && !backing) { e.stopPropagation(); props.onSelect(c.id, true); } } },
                   clips.map(function (cl) {
                     // interactive clip (decision 4): click select · drag move (same lane, snapped) · Ctrl+C/V.
                     // Backing/Project clips are inert (no mousedown handler, no selection).
@@ -673,6 +680,8 @@
                       h(LaneWave, { peaks: cl.peaks, color: backing ? "rgba(199,125,255,0.9)" : "rgba(157,78,221,0.95)", rev: props.rev + ":" + fit }));
                   }),
                   live ? h("div", { className: "sm-clip live", style: { left: pct(live.startTick), width: pct(live.lengthTicks) } }, h(LaneWave, { peaks: live.peaks, color: "rgba(255,59,107,0.95)", rev: (live.peaks || []).length })) : null,
+                  // Fix B — active time-range highlight (this lane only); visually distinct from clip select.
+                  rng ? h("div", { className: "sm-range", style: { left: pct(rng.startTick), width: pct(Math.max(0, rng.endTick - rng.startTick)) } }) : null,
                   (!clips.length && !live) ? h("span", { className: "sm-emptyhint" }, backing ? "Backing track" : "Empty lane — select as record target") : null));
             })
           : h("div", { className: "sm-noneyet" }, "No audio lanes. Add a track or Add Producer Track to start tracking.")));
@@ -722,7 +731,11 @@
           // tap -> master; default OFF; ON warns about speaker feedback. Behavior unchanged from before.
           h("button", { className: "rz-mon" + (props.monitor ? " on" : ""), onClick: props.onToggleMonitor, "aria-label": "Toggle input monitoring",
             title: props.monitor ? "Input monitoring ON — you hear your mic input (use headphones)" : "Monitor input — hear your mic in real time. Use headphones; monitoring through speakers will feed back." }, h(I.Headphones, { width: 13, height: 13 })),
-          h("div", { className: "rz-vu" }, h(W.MeterBar, { master: true, idx: 0 }), h(W.MeterBar, { master: true, idx: 1 }))),
+          h("div", { className: "rz-vu" }, h(W.MeterBar, { master: true, idx: 0 }), h(W.MeterBar, { master: true, idx: 1 })),
+          // Fix A — recording-latency calibration (ms). Trims residual take alignment by ear per device;
+          // additive to the measured capture latency at placement. Positive = shift takes earlier.
+          h("label", { className: "rz-calib", title: "Recording latency calibration (ms). Positive nudges recorded takes earlier, negative later. Tune per device with the manual test." },
+            "CAL", h("input", { type: "number", step: 1, value: props.calibMs || 0, onChange: function (e) { props.onSetCalib && props.onSetCalib(e.target.value); }, "aria-label": "Recording latency calibration in milliseconds" }), "ms")),
         h("div", { className: "rz-state" + (props.recErr ? " err" : "") }, readout)));
   }
 
@@ -731,10 +744,10 @@
     return h("div", { className: "studio" },
       h(TrackSourceManager, { tracks: tracks, selected: props.selected, bouncing: props.bouncing, bounceProg: props.bounceProg, onBounce: props.onBounce, onUpload: props.onUpload, onSelect: props.onSelect, onMute: props.onMute, onDelete: props.onDelete, onReplace: props.onReplace }),
       h("div", { className: "studio-center" },
-        h(AudioLaneMatrix, { tracks: tracks, selected: props.selected, playing: props.playing, playTick: props.playTick, rev: props.rev, fitTicks: props.fitTicks, recPhase: props.recPhase, recPreview: props.recPreview, recStartTick: props.recStartTick, selClip: props.selClip, dragScrub: props.dragScrub, dragRed: props.dragRed, onClipDown: props.onClipDown, onSelectClip: props.onSelectClip, onSelect: props.onSelect, onAddTrack: props.onAddTrack, onOpenTake: props.onOpenTake }),
+        h(AudioLaneMatrix, { tracks: tracks, selected: props.selected, playing: props.playing, playTick: props.playTick, rev: props.rev, fitTicks: props.fitTicks, recPhase: props.recPhase, recPreview: props.recPreview, recStartTick: props.recStartTick, selClip: props.selClip, rangeSel: props.rangeSel, onRangeDown: props.onRangeDown, dragScrub: props.dragScrub, dragRed: props.dragRed, onClipDown: props.onClipDown, onSelectClip: props.onSelectClip, onSelect: props.onSelect, onAddTrack: props.onAddTrack, onOpenTake: props.onOpenTake }),
         h(StudioRuler, { fitTicks: props.fitTicks, playTick: props.playTick, recording: props.recPhase === "recording", recPos: (props.recPreview ? (props.recPreview.startTick + props.recPreview.lengthTicks) : -1), dragScrub: props.dragScrub }),
         h("div", { className: "studio-bottombar" },
-        h(RecordBar, { selected: props.selected, onRecord: props.onRecord, playing: props.playing, onPlay: props.onPlay, onStop: props.onStop, recPhase: props.recPhase, countBeat: props.countBeat, recErr: props.recErr, rev: props.rev, playTick: props.playTick, recStartTick: props.recStartTick, monitor: props.monitor, onToggleMonitor: props.onToggleMonitor }),
+        h(RecordBar, { selected: props.selected, onRecord: props.onRecord, playing: props.playing, onPlay: props.onPlay, onStop: props.onStop, recPhase: props.recPhase, countBeat: props.countBeat, recErr: props.recErr, rev: props.rev, playTick: props.playTick, recStartTick: props.recStartTick, monitor: props.monitor, onToggleMonitor: props.onToggleMonitor, calibMs: props.calibMs, onSetCalib: props.onSetCalib }),
         window.StudioPlugins
           ? h(window.StudioPlugins, { tracks: tracks, selected: props.selected, bpm: props.bpm, rev: props.rev, triplet: props.triplet, bouncing: props.bouncing, onSelect: props.onSelect, onMute: props.onMute, onDelete: props.onDelete, onReplace: props.onReplace, commit: props.commit })
           : null)));
@@ -803,6 +816,7 @@
     var recFlowRef = useRef({ raf: 0, timers: [], captureTick: 0, engageTime: 0, cancelled: false });
     var recycleRef = useRef([]);                                                       // session recycle buffer for soft-deleted tracks
     var monS = useState(false); var monitor = monS[0], setMonitor = monS[1];           // input-monitoring toggle (session state, always OFF on load — decision 2)
+    var rcaS = useState(0); var recCalib = rcaS[0], setRecCalibState = rcaS[1];         // Fix A: recording-latency calibration mirror (ms; authority is engine._recCalibMs)
     // studio auto-fit: one shared time->width scale (session max ticks, with headroom). fitTicksRef
     // mirrors the state so the recording rAF poll reads a fresh value without re-subscribing.
     var ftS = useState(0); var fitTicks = ftS[0], setFitTicks = ftS[1];
@@ -810,6 +824,9 @@
     var rsS = useState(0); var recStartTick = rsS[0], setRecStartTick = rsS[1];         // movable RED record-start / punch-in position (ticks) — decision 3
     var scS = useState(null); var selClip = scS[0], setSelClip = scS[1];                // selected Studio clip id — decision 4
     var studioClipboard = useRef(null);                                                // session clip clipboard (deep-copied clip, shared buffer) — decision 4
+    var rgsS = useState(null); var rangeSel = rgsS[0], setRangeSel = rgsS[1];           // Fix B: active per-lane time range {ch,startTick,endTick} (right-drag)
+    var studioRangeClip = useRef(null);                                                // Fix B: range clipboard {ch, span, items:[segments]} (buffers shared)
+    var studioClipMode = useRef("clip");                                               // Fix B: which clipboard Ctrl+V uses — 'clip' | 'range'
     var studioKbdRef = useRef({});                                                     // live mirror for the global key handler (Studio shortcuts)
 
     useEffect(function () {
@@ -828,11 +845,13 @@
         var sk = studioKbdRef.current;
         if (sk && sk.studio) {
           if (ctrlK && e.code === "KeyZ" && !e.shiftKey) { e.preventDefault(); sk.undo(); return; }
-          if (ctrlK && e.code === "KeyC") { e.preventDefault(); sk.copy(); return; }        // clip copy (decision 4)
-          if (ctrlK && e.code === "KeyV") { e.preventDefault(); sk.paste(); return; }        // clip paste at the red line
+          if (ctrlK && e.code === "KeyC") { e.preventDefault(); sk.copy(); return; }        // range OR clip copy (Fix B / decision 4)
+          if (ctrlK && e.code === "KeyV") { e.preventDefault(); sk.paste(); return; }        // range OR clip paste at the red line
           if (!ctrlK && !e.altKey && !e.shiftKey) {
+            if (e.code === "Escape" && sk.range) { e.preventDefault(); sk.clearRange(); return; }   // Fix B: Escape clears the range
             if (e.code === "KeyM") { e.preventDefault(); if (sk.sel) sk.mute(sk.sel); return; }
-            if (e.code === "Delete" || e.code === "Backspace") { e.preventDefault(); if (sk.sel) sk.del(sk.sel); return; }
+            // Fix B: a live range deletes ONLY the range (split + gap); otherwise Del removes the track (prior behavior).
+            if (e.code === "Delete" || e.code === "Backspace") { e.preventDefault(); if (sk.range) sk.delRange(); else if (sk.sel) sk.del(sk.sel); return; }
           }
         }
         if (ctrlK && e.code === "KeyZ" && !e.shiftKey) { e.preventDefault(); doUndo(); return; }
@@ -967,6 +986,9 @@
       if (E._cap && E._cap.monGain) { engage(); return; }               // mic already armed this session — just route
       E.armMicCapture({ onReady: engage, onError: function () { toast("Microphone access denied — check browser settings", h(I.X, null)); } });
     }
+    // Fix A — set the per-session recording-latency calibration (ms). Additive to the measured capture
+    // latency at clip placement; positive shifts takes earlier. Engine owns the value; state mirrors it.
+    function setRecCalibration(ms) { var v = Math.round(+ms || 0); E.setRecCalib(v); setRecCalibState(v); }
 
     // ---- Rec-Audio auto-fit scale + shared scrub (decisions 3, 4, 5) --------------------------
     // session max ticks across the Studio tracks' clips (end of the longest clip / backing), floored to
@@ -1054,7 +1076,7 @@
     // Backing/Project lanes are inert (guarded by the caller).
     function studioClipDown(e, clip) {
       if (e.button !== 0) return; e.stopPropagation();
-      setSelClip(clip.id);
+      setSelClip(clip.id); setRangeSel(null);                          // clip-select clears any active range (modes are exclusive)
       var el = e.currentTarget.closest(".sm-lanes"); if (!el) return;
       var r = el.getBoundingClientRect(), contentW = Math.max(1, (r.right - 12) - (r.left + 232));
       var maxT = fitTicksRef.current || studioSessionTicks();
@@ -1082,7 +1104,7 @@
       if (!selClip) return; var c = E.timeline.clips.find(function (x) { return x.id === selClip; });
       var d = c && E.channels[c.ch] ? E.channels[c.ch].def : null;
       if (!c || (d && isBackingDef(d))) return;                        // backing clips aren't copyable
-      studioClipboard.current = JSON.parse(JSON.stringify(c));
+      studioClipboard.current = JSON.parse(JSON.stringify(c)); studioClipMode.current = "clip";
       toast("Clip copied · Ctrl+V to paste at the red line", h(I.Note, { width: 16, height: 16 }));
     }
     // Ctrl/Cmd+V — paste onto the SAME lane at the red-line position (confirmed default). New id, shared
@@ -1100,6 +1122,92 @@
       setSelClip(nc.id); setStudioSel(src.ch); bump();
       toast("Clip pasted · Ctrl+Z to undo", h(I.Note, { width: 16, height: 16 }));
     }
+    // ================= Fix B: bar-range selection / copy / paste / delete inside audio lanes =============
+    // Studio-view grid snap: 1/16 by default, 1/16-triplet when the shared triplet toggle is on. Mirrors
+    // the Producer marquee's snap discipline (file 09) adapted to the fit-scaled single-lane coordinates.
+    function studioSnap(tick) {
+      var S = triplet ? Math.round(E.PPQ / 6) : E.SNAP_TICKS;          // PPQ/6 = 1/16T ; SNAP_TICKS = 1/16
+      return Math.max(0, Math.round(tick / S) * S);
+    }
+    // Right-drag across a NON-backing lane body selects a snapped TIME RANGE on THAT lane (per-lane this
+    // build). Reuses the file-09 marquee gesture shape (right-button drag, live rect, normalize on release);
+    // coordinates come from the lane body's own rect (each lane is its own fit-scaled track).
+    function studioRangeDown(e, laneId) {
+      if (e.button !== 2) return;
+      e.preventDefault(); e.stopPropagation();
+      var d = E.channels[laneId] ? E.channels[laneId].def : null;
+      if (!d || isBackingDef(d)) return;                               // backing/Project lanes are inert
+      setSelClip(null);                                                // range + clip selection are mutually exclusive
+      var body = e.currentTarget, r = body.getBoundingClientRect();
+      var maxT = fitTicksRef.current || studioSessionTicks();
+      function tickAt(ev) { var f = Math.max(0, Math.min(1, (ev.clientX - r.left) / Math.max(1, r.width))); return studioSnap(f * maxT); }
+      var a = tickAt(e);
+      function apply(ev) { var b = tickAt(ev); setRangeSel({ ch: laneId, startTick: Math.min(a, b), endTick: Math.max(a, b) }); }
+      apply(e);
+      function mv(ev) { apply(ev); }
+      function up(ev) {
+        window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up);
+        if (Math.abs(tickAt(ev) - a) < E.SNAP_TICKS / 2) setRangeSel(null);   // a click (no real drag) selects nothing
+      }
+      window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+    }
+    // Delete ONLY the selected range: split intersected clips at the range boundaries (same non-destructive
+    // slice math as splitClipAt / overwriteLaneRegion), drop the middle, leave a gap. The lane's pre-state
+    // goes to the recycle buffer so one Ctrl/Cmd+Z restores it.
+    function deleteRange() {
+      var rng = rangeSel; if (!rng || rng.endTick <= rng.startTick) { setRangeSel(null); return; }
+      var d = E.channels[rng.ch] ? E.channels[rng.ch].def : null;
+      if (!d || isBackingDef(d)) { setRangeSel(null); return; }
+      var res = overwriteLaneRegion(rng.ch, rng.startTick, rng.endTick, null);
+      E.timeline.clips = res.kept;                                     // gap left where the range was
+      recycleRef.current.push({ type: "record", laneId: rng.ch, before: res.before, newClipId: null });
+      E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
+      setRangeSel(null); setSelClip(null); bump();
+      toast("Range deleted · Ctrl+Z to undo", h(I.X, { width: 16, height: 16 }));
+    }
+    // Copy the in-range portions of intersected clips as independent segments (buffers SHARED), stored
+    // relative to the range start so paste can re-anchor them at the red line.
+    function studioCopyRange() {
+      var rng = rangeSel; if (!rng || rng.endTick <= rng.startTick) return;
+      var items = [];
+      E.timeline.clips.forEach(function (c) {
+        if (c.ch !== rng.ch || c.kind !== "audio") return;
+        var cs = c.startTick || 0, ce = cs + (c.lengthTicks || 0);
+        var s = Math.max(cs, rng.startTick), en = Math.min(ce, rng.endTick);
+        if (en <= s) return;                                           // no overlap with the range
+        var seg = JSON.parse(JSON.stringify(c));
+        seg.startOffset = s - rng.startTick;                           // position of this segment within the copied span
+        seg.lengthTicks = en - s;
+        seg.offsetTicks = (c.offsetTicks || 0) + (s - cs);             // window into the shared buffer
+        items.push(seg);
+      });
+      if (!items.length) { toast("Range is empty — nothing to copy", h(I.X, null)); return; }
+      studioRangeClip.current = { ch: rng.ch, span: rng.endTick - rng.startTick, items: items };
+      studioClipMode.current = "range";
+      toast(items.length + " segment" + (items.length === 1 ? "" : "s") + " copied · Ctrl+V pastes at the red line", h(I.Note, { width: 16, height: 16 }));
+    }
+    // Paste the copied range at the red line on the SOURCE lane (confirmed default). Segments become
+    // independent clips (new ids) sharing the source buffers; the pasted span overwrites overlapped
+    // material through the recycle rule (one Ctrl/Cmd+Z restores).
+    function studioPasteRange() {
+      var rc = studioRangeClip.current; if (!rc || !rc.items.length) return;
+      var d = E.channels[rc.ch] ? E.channels[rc.ch].def : null;
+      if (!d || isBackingDef(d)) { toast("That lane is locked", h(I.X, null)); return; }
+      var base = Math.max(0, recStartTick), span = Math.max(E.SNAP_TICKS, rc.span);
+      var res = overwriteLaneRegion(rc.ch, base, base + span, null);
+      var added = rc.items.map(function (seg) {
+        var nc = JSON.parse(JSON.stringify(seg)); nc.id = E._newClipId(); nc.startTick = base + (seg.startOffset || 0); delete nc.startOffset; return nc;
+      });
+      E.timeline.clips = res.kept.concat(added);
+      recycleRef.current.push({ type: "record", laneId: rc.ch, before: res.before, newClipId: null });
+      E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
+      setStudioSel(rc.ch); setRangeSel(null); bump();
+      toast("Range pasted · Ctrl+Z to undo", h(I.Note, { width: 16, height: 16 }));
+    }
+    // Ctrl+C / Ctrl+V dispatch: a range takes precedence over a whole-clip selection; paste follows the
+    // clipboard that was last filled. Whole-clip copy/paste (prior build) is untouched when no range exists.
+    function studioCopy() { if (rangeSel) studioCopyRange(); else studioCopyClip(); }
+    function studioPaste() { if (studioClipMode.current === "range" && studioRangeClip.current) studioPasteRange(); else studioPasteClip(); }
     // load a decoded buffer as a locked "Project" backing track (bounce OR upload). Always labeled
     // "Project"; type:'backing' (trackType), locked/read-only. Backing tracks stack (append) — never
     // a lane-0 race — and render sorted-first in the Studio views.
@@ -1213,7 +1321,7 @@
             setCountBeat(0); setRecPhase("recording");
             var poll = function () {
               if (recFlowRef.current.cancelled || !E.isMicCapturing()) return;
-              var st = Math.max(0, flow.captureTick - E.secToTick(flow.latency));
+              var st = Math.max(0, flow.captureTick - E.secToTick(flow.latency + E.recCalibSec()));   // Fix A: match placeTake (capture latency + calibration)
               var len = Math.max(E.SNAP_TICKS, E.secToTick(E.captureElapsed()));
               setRecPreview({ ch: flow.laneId, startTick: st, lengthTicks: len, peaks: E.capturePeaks(600) });
               refitStudio({ growing: true, extra: st + len });          // live re-fit when the take extends the session (throttled inside)
@@ -1260,7 +1368,8 @@
     function placeTake(laneId, captureTick, result) {
       var bufId = "cap_" + (++E._recSeq);
       E.userBuffers[bufId] = result.buffer;
-      var startTick = Math.max(0, captureTick - E.secToTick(result.latencySec || 0));   // latency compensation (rule 6)
+      var comp = (result.latencySec || 0) + E.recCalibSec();                            // Fix A: capture-side latency + session calibration
+      var startTick = Math.max(0, captureTick - E.secToTick(comp));                     // latency compensation (rule 6)
       var lengthTicks = Math.max(E.SNAP_TICKS, E.secToTick(result.durSec));
       var endTick = startTick + lengthTicks;
       var before = E.timeline.clips.filter(function (c) { return c.ch === laneId; }).map(function (c) { return JSON.parse(JSON.stringify(c)); });
@@ -1276,7 +1385,7 @@
       var clip = { id: E._newClipId(), kind: "audio", ch: laneId, startTick: startTick, lengthTicks: lengthTicks,
         bufferId: bufId, offsetTicks: 0, name: "Take", peaks: E.computePeaks(result.buffer), gain: 1,
         fadeInTicks: 0, fadeOutTicks: 0, trimmed: true,
-        meta: { source: "mic", latencyOffsetSec: result.latencySec || 0, capturedAt: Date.now() } };
+        meta: { source: "mic", latencyOffsetSec: comp, measuredLatencySec: result.latencySec || 0, calibMs: E.getRecCalib(), capturedAt: Date.now() } };
       kept.push(clip); E.timeline.clips = kept;
       recycleRef.current.push({ type: "record", laneId: laneId, before: before, newClipId: clip.id });
       try { var blob = E._encodeWav(result.buffer); if (E.SampleDB) E.SampleDB.put(bufId, blob); } catch (e) {}
@@ -1468,7 +1577,7 @@
     var editingClip = (editClip && E.timeline.clips.indexOf(editClip) >= 0) ? editClip : null;   // guard against deleted/undone clips
 
     // live mirror for the global key handler (Studio M/Del/R/Ctrl+Z shortcuts)
-    studioKbdRef.current = { studio: studio, sel: studioSel, mute: toggleStudioMute, del: requestDeleteStudioTrack, undo: studioUndo, copy: studioCopyClip, paste: studioPasteClip };
+    studioKbdRef.current = { studio: studio, sel: studioSel, range: !!rangeSel, mute: toggleStudioMute, del: requestDeleteStudioTrack, delRange: deleteRange, clearRange: function () { setRangeSel(null); }, undo: studioUndo, copy: studioCopy, paste: studioPaste };
     E._recMode = studio;   // mode-scoped playback filter (Producer=false, Rec Audio=true)
 
     return h(React.Fragment, null,
@@ -1476,8 +1585,9 @@
         h(Transport, { playing: playing, bpm: bpm, swing: swing, master: master, active: active, pos: posStr(playStep, playBar, mode), studio: studio, onToggleStudio: toggleStudio, onPlay: togglePlay, onStop: stop, onBpm: function (v) { E.setTempo(v); setBpm(v); }, onSwing: function (v) { E.setSwing(v); setSwing(v); }, onPattern: pattern, onProducerMaster: exportProducerMaster, onRecAudioMaster: exportRecAudioMaster, exporting: exporting, exportProg: exportProg, recAvailable: recAudioAvailable }),
         studio
           ? h(StudioMode, { channelDefs: E.studioDefs(), bpm: bpm, playing: playing, playTick: playTick, rev: rev, triplet: triplet, selected: studioSel, bouncing: bouncing, bounceProg: bounceProg, commit: bump, onPlay: togglePlay, onStop: stop,
-              fitTicks: fitTicks, dragScrub: studioDragScrub, dragRed: studioDragRed, recStartTick: recStartTick, onSelectClip: setSelClip, selClip: selClip, onClipDown: studioClipDown,
-              monitor: monitor, onToggleMonitor: toggleMonitor,
+              fitTicks: fitTicks, dragScrub: studioDragScrub, dragRed: studioDragRed, recStartTick: recStartTick, onSelectClip: function (v) { setSelClip(v); if (!v) setRangeSel(null); }, selClip: selClip, onClipDown: studioClipDown,
+              rangeSel: rangeSel, onRangeDown: studioRangeDown,
+              monitor: monitor, onToggleMonitor: toggleMonitor, calibMs: recCalib, onSetCalib: setRecCalibration,
               recPhase: recPhase, countBeat: countBeat, recPreview: recPreview, recErr: recErr,
               onSelect: selectStudioTrack, onAddTrack: addAudioLaneTrack, onRecord: toggleRecord, onOpenTake: openDual,
               onMute: toggleStudioMute, onDelete: requestDeleteStudioTrack, onReplace: replaceBacking, onBounce: bounceCurrent, onUpload: uploadBacking })
