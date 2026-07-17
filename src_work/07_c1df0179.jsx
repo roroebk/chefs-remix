@@ -368,12 +368,11 @@
     function isOpen() { return true; }
     function toggle() {}
 
-    // ---- header (dropdown + follow-armed + inline M/X) ----
+    // ---- header (dropdown = single authority for plugin focus AND record target) ----
     var header = h("div", { className: "plg-head" },
       h("span", { className: "pt" }, "Plugins"),
       h("div", { className: "plg-headright" },
-        selDef ? h("span", { className: "plg-status" + (props.armed === chId ? " armed" : "") + (selDef.uiMuted ? " muted" : "") }, props.armed === chId ? "ARMED" : selDef.uiMuted ? "MUTED" : backing ? "READ ONLY" : "EDIT") : null,
-        h("button", { className: "follow-armed" + (props.followArmed ? " on" : ""), onClick: props.onToggleFollow, title: "Plugins panel follows the armed track (manual selection turns this off)" }, "Follow Armed"),
+        selDef ? h("span", { className: "plg-status" + (selDef.uiMuted ? " muted" : "") }, selDef.uiMuted ? "MUTED" : backing ? "READ ONLY" : "EDIT") : null,
         h("div", { className: "plg-dropdown" },
           h("button", { className: "plg-dd-btn", onClick: function () { setDdOpen(!ddOpen); } }, selDef ? (selDef.label + " · " + (backing ? "PROJECT" : "AUDIO")) : "No track", h("span", { className: "plg-dd-car" }, " ▾")),
           // M/✕ consolidated to the left TRACKS list — the dropdown only selects the track for the panel.

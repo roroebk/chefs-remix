@@ -113,7 +113,9 @@
     this.banks = [blankPattern(), blankPattern(), blankPattern(), blankPattern()];
     this.activePattern = 0; this.focus = null; this._catalog = CHANNELS;   // factory defs for Add Track / demo
     this.userBuffers = {}; this._bufSeq = 0; this._micRec = null;          // decoded sampler buffers (import / mic)
-    this._recState = null; this._recSeq = 0;                                // continuous timeline audio recording
+    this._recState = null; this._recSeq = 0;                                // continuous timeline audio recording (MediaRecorder path)
+    this._micStream = null; this._cap = null;                               // Sprint B: cached mic stream + live PCM capture state
+    this._monitorOn = false;                                                // Rec-Audio enhancement: input-monitoring toggle (session state, defaults OFF)
     this._perfArmed = false; this._perfClips = {}; this._openNotes = {}; this._midiOn = false;  // MIDI/keyboard performance
     this._hist = { stack: [], idx: -1, lastJSON: null };                    // undo/redo snapshot history
     // arrangement (legacy pattern/bank model — still authoritative until the timeline is wired in)
@@ -204,17 +206,23 @@
       var dl = ctx.createDelay(1.5); dl.delayTime.value = 0.3;
       var fb = ctx.createGain(); fb.gain.value = 0;
       var wet = ctx.createGain(); wet.gain.value = 0;
+      // Fix 2 — real REVERB send (was a no-op: the "reverb" FX type had no node). Parallel convolver
+      // off comp, mixed back at the fader. Buffer built lazily in _applyFx when a reverb slot activates
+      // (sized by the Size param); rvWet stays 0 in the dry zero-state, so fresh sessions are unaffected.
+      var conv = ctx.createConvolver();
+      var rvWet = ctx.createGain(); rvWet.gain.value = 0;
       var fader = ctx.createGain(); fader.gain.value = 0.8;
       var pan = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
       var an = ctx.createAnalyser(); an.fftSize = 512; an.smoothingTimeConstant = 0.5;
       input.connect(bit); bit.connect(filt); filt.connect(comp);
       comp.connect(dry); comp.connect(dl); dl.connect(fb); fb.connect(dl); dl.connect(wet);
-      dry.connect(fader); wet.connect(fader);
+      comp.connect(conv); conv.connect(rvWet);
+      dry.connect(fader); wet.connect(fader); rvWet.connect(fader);
       fader.connect(an);
       if (pan) { an.connect(pan); pan.connect(self.master); } else { an.connect(self.master); }
       self.inserts[def.id] = {
         def: def, name: def.name, input: input, bit: bit, filt: filt, comp: comp,
-        dry: dry, delay: dl, fb: fb, wet: wet, fader: fader, pan: pan, analyser: an,
+        dry: dry, delay: dl, fb: fb, wet: wet, conv: conv, rvWet: rvWet, rvSize: -1, fader: fader, pan: pan, analyser: an,
         vol: 0.8, panVal: 0, mute: false, solo: false,
         fx: self._defaultFx(def.id), meterData: new Uint8Array(an.fftSize)
       };
@@ -264,23 +272,36 @@
   // recompute the real FX node values from an insert's slot params (mix = wet/dry)
   Engine.prototype._applyFx = function (id) {
     var ins = this.inserts[id]; if (!ins) return;
-    var bit = null, filt = null, delayish = null, comp = null;
+    var bit = null, filt = null, delayish = null, comp = null, reverb = null;
     ins.fx.forEach(function (s) {
       if (!s.type || s.bypass) return;
       if (s.type === "bitcrush") bit = s;
       else if (s.type === "filter") filt = s;
       else if (s.type === "delay" || s.type === "chorus") delayish = s;
       else if (s.type === "comp") comp = s;
+      else if (s.type === "reverb") reverb = s;
     });
     ins.bit.curve = bit ? this._bitCurve(bit.params.bits) : this._linearCurve();
     if (filt) { ins.filt.type = filt.params.mode; ins.filt.frequency.value = filt.params.freq; ins.filt.Q.value = filt.params.q; }
     else { ins.filt.type = "lowpass"; ins.filt.frequency.value = 20000; ins.filt.Q.value = 0.7; }
     if (comp) { ins.comp.threshold.value = comp.params.thr; ins.comp.ratio.value = comp.params.ratio; }
     else { ins.comp.threshold.value = 0; ins.comp.ratio.value = 1; }
+    // Fix 2 — perceptual (exponential) wet mapping so the TOP of the range is dramatic. pow(x,0.6)
+    // lifts the whole curve (a low knob is already clearly audible), and the ceiling multipliers push
+    // high settings well past the old timid 0.6/0.85. Backward-compatible in ORDERING (monotonic, same
+    // param meaning) — a louder wet at a given stored value is the intended audibility boost.
     if (delayish) {
-      if (delayish.type === "chorus") { ins.delay.delayTime.value = 0.022; ins.fb.gain.value = 0.18; ins.wet.gain.value = (delayish.params.mix != null ? delayish.params.mix : 0.4) * 0.6; }
-      else { ins.delay.delayTime.value = delayish.params.time; ins.fb.gain.value = delayish.params.fb; ins.wet.gain.value = (delayish.params.mix != null ? delayish.params.mix : delayish.params.wet) * 0.85; }
+      if (delayish.type === "chorus") { ins.delay.delayTime.value = 0.022; ins.fb.gain.value = 0.22; ins.wet.gain.value = Math.pow((delayish.params.mix != null ? delayish.params.mix : 0.4), 0.6) * 1.1; }
+      else { ins.delay.delayTime.value = delayish.params.time; ins.fb.gain.value = Math.min(0.92, delayish.params.fb); ins.wet.gain.value = Math.pow((delayish.params.mix != null ? delayish.params.mix : delayish.params.wet), 0.6) * 1.25; }
     } else { ins.fb.gain.value = 0; ins.wet.gain.value = 0; }
+    // reverb send (Fix 2): build/refresh the impulse when Size changes; perceptual wet -> DRENCHED at
+    // the top. Uses the `wet` param (0..0.8) as primary, `size` for the tail length. Dry when absent.
+    if (reverb) {
+      var sz = reverb.params.size != null ? reverb.params.size : 0.6;
+      if (Math.abs(sz - ins.rvSize) > 0.001 || !ins.conv.buffer) { ins.conv.buffer = this._makeImpulse(0.4 + sz * 3.6, 1.6 + sz * 2.6); ins.rvSize = sz; }
+      var rw = reverb.params.wet != null ? reverb.params.wet : (reverb.params.mix != null ? reverb.params.mix * 0.8 : 0.24);
+      ins.rvWet.gain.value = Math.pow(rw / 0.8, 0.55) * 1.7;    // wet=0.8 -> ~1.7 (drenched); low wet still clearly audible
+    } else { ins.rvWet.gain.value = 0; }
     // Pitch Fix (Auto-Tune)
     var pf = null; ins.fx.forEach(function (s) { if (s.type === "pitchfix" && !s.bypass) pf = s; });
     ins.pitchActive = !!pf;
@@ -584,7 +605,7 @@
     var label = (name || "Sample").replace(/\.[a-z0-9]+$/i, "").slice(0, 22);
     var def = { id: id, label: label, type: "sampler", kind: "sampler", color: opts.color || "#C77DFF", route: route,
                 vol: 0.9, pan: 0, tonal: opts.tonal !== false, base: opts.base != null ? opts.base : 60,
-                bufferId: id, sampleId: id, userAudio: true };
+                bufferId: id, sampleId: id, userAudio: true, workspace: "producer" };
     this.channelDefs.push(def);
     this.banks.forEach(function (bk) { bk.steps[id] = freshStepRow(patLen(bk)); });
     this._wireChannel(def);
@@ -611,7 +632,7 @@
     var route = Math.min(16, maxRoute + 1);
     var label = (name || "Melody").replace(/\.[a-z0-9]+$/i, "").slice(0, 22);
     var def = { id: id, label: label, type: "sampler", kind: "polySampler", color: "#9d4edd", route: route,
-                vol: 0.9, pan: 0, tonal: true, base: 60, bufferId: id, sampleId: id, userAudio: true,
+                vol: 0.9, pan: 0, tonal: true, base: 60, bufferId: id, sampleId: id, userAudio: true, workspace: "producer",
                 synth: { wave: "sawtooth", attack: 0.005, decay: 0.12, sustain: 0.8, release: 0.12 } };
     this.channelDefs.push(def);
     this.banks.forEach(function (bk) { bk.steps[id] = freshStepRow(patLen(bk)); });
@@ -647,11 +668,13 @@
 
   // ---- continuous timeline audio recording (BandLab-style) ------------------
   // a dedicated audio lane that hosts recorded clips (no synthesis voice)
-  Engine.prototype.addAudioTrack = function (name) {
+  // `workspace` tags the owning mode: Studio "Add Track" passes 'studio'; melody imports (addMelodyFile)
+  // leave it default 'producer' so an imported melody lane stays in the Producer arrangement.
+  Engine.prototype.addAudioTrack = function (name, workspace) {
     this.init();
     var n = 1, id = "rec"; while (this.channels[id]) { id = "rec_" + (++n); }
     var maxRoute = 0; this.channelDefs.forEach(function (c) { if (c.route > maxRoute) maxRoute = c.route; });
-    var def = { id: id, label: name || ("Audio " + n), type: "audio", kind: "audioLane", color: "#C77DFF", route: Math.min(16, maxRoute + 1), vol: 0.9, pan: 0, tonal: false, base: 0, audioLane: true };
+    var def = { id: id, label: name || ("Audio " + n), type: "audio", kind: "audioLane", color: "#C77DFF", route: Math.min(16, maxRoute + 1), vol: 0.9, pan: 0, tonal: false, base: 0, audioLane: true, workspace: workspace === "studio" ? "studio" : "producer" };
     this.channelDefs.push(def);
     this.banks.forEach(function (bk) { bk.steps[id] = freshStepRow(patLen(bk)); });
     this._wireChannel(def); this.focus = id;
@@ -707,6 +730,7 @@
     o.frequency.value = accent ? 1760 : 1200; g.gain.setValueAtTime(0.0001, time);
     g.gain.exponentialRampToValueAtTime(accent ? 0.4 : 0.25, time + 0.002); g.gain.exponentialRampToValueAtTime(0.0001, time + 0.06);
     o.connect(g); g.connect(this.master); o.start(time); o.stop(time + 0.07);
+    return o;   // returned so a cancellable count-in can stop a not-yet-started click
   };
   // shared: wire an obtained MediaStream into analyser (live waveform) + optional monitor +
   // MediaRecorder, then hold it in _recState. Used by both mic and screen/tab capture. Records
@@ -778,6 +802,171 @@
       idbPut(bufId, blob)["catch"](function (e) { console.warn("[SampleDB] recording save failed:", e); });
       onDone && onDone(clip);
     }, function (e) { onError && onError(e); });
+  };
+
+  // ============================================================================
+  // Sprint B — LIVE MICROPHONE CAPTURE (Studio Mode)
+  // Real PCM capture replacing the Studio record stub. Sample-accurate engagement
+  // via an AudioWorklet gated on the audio clock (ScriptProcessor fallback), writing
+  // Float32 straight into a growing buffer. The input is connected through a 0-gain
+  // node only (NO monitoring path -> feedback impossible by construction, rule 1).
+  // Additive: leaves the MediaRecorder pipeline (_beginStreamRecording, used by the
+  // file-09 screen capture) untouched.
+  // ============================================================================
+  Engine.prototype.getBPM = function () { return this.tempo; };   // transport BPM accessor (prompt contract; engine has no `transport` object)
+
+  // worklet source (runs in AudioWorkletGlobalScope). Gates copying on the audio clock:
+  // begins at `startTime`, ends at `stopTime`, posts each 128-sample quantum to the main thread.
+  Engine.prototype._captureWorkletSrc = function () {
+    return "class PcmCapture extends AudioWorkletProcessor{" +
+      "constructor(){super();this._armed=false;this._started=false;this._startTime=0;this._stopTime=Infinity;" +
+      "this.port.onmessage=(e)=>{var d=e.data||{};" +
+      "if(d.cmd==='arm'){this._startTime=d.at||0;this._stopTime=Infinity;this._armed=true;this._started=false;}" +
+      "else if(d.cmd==='stop'){this._stopTime=(d.at!=null)?d.at:currentTime;}" +
+      "else if(d.cmd==='disarm'){this._armed=false;this._started=false;}};}" +
+      "process(inputs){if(this._armed){var t=currentTime;" +
+      "if(!this._started&&t>=this._startTime){this._started=true;this.port.postMessage({ev:'started',at:t});}" +
+      "if(this._started&&t<this._stopTime){var ch=inputs[0]&&inputs[0][0];if(ch)this.port.postMessage(ch.slice(0));}" +
+      "if(this._started&&t>=this._stopTime){this._armed=false;this._started=false;this.port.postMessage({ev:'stopped',at:t});}}" +
+      "return true;}}registerProcessor('pcm-capture',PcmCapture);";
+  };
+
+  // Permission-FIRST (rule 4): obtain/verify the mic stream BEFORE anything else. Caches the granted
+  // stream for the session; builds the capture node (worklet or ScriptProcessor fallback) wired
+  // src -> node -> silent(gain 0) -> master. onReady(latencySec, sampleRate); onError(err).
+  Engine.prototype.armMicCapture = function (opts) {
+    this.init(); this.resume(); var self = this; opts = opts || {};
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { opts.onError && opts.onError(new Error("Microphone unsupported")); return; }
+    function proceed(stream) {
+      // tear down any prior capture graph first (re-arm / monitor re-toggle) so source/monitor/silent
+      // nodes never stack — otherwise an earlier monitor gain would stay wired to master (double-gain
+      // when monitoring, and a node leak per re-arm). Pre-existing latent leak; fixed here since the
+      // monitor tap makes it audible.
+      if (self._cap) {
+        try { self._cap.src.disconnect(); } catch (e) {}
+        try { if (self._cap.node) self._cap.node.disconnect(); } catch (e) {}
+        try { if (self._cap.silent) self._cap.silent.disconnect(); } catch (e) {}
+        try { if (self._cap.monGain) self._cap.monGain.disconnect(); } catch (e) {}
+      }
+      self._micStream = stream;
+      var track = stream.getAudioTracks()[0];
+      var settings = (track && track.getSettings) ? track.getSettings() : {};
+      var latency = (self.ctx.baseLatency || 0) + (typeof settings.latency === "number" ? settings.latency : 0);
+      if (!latency) latency = 0.012;                          // measured/config default when the UA hides track latency
+      var src = self.ctx.createMediaStreamSource(stream);
+      var silent = self.ctx.createGain(); silent.gain.value = 0; silent.connect(self.master);   // capture path sink: 0 gain => the CAPTURE branch never monitors
+      // input MONITORING = a PARALLEL tap off the raw input source, PRE-capture-buffer (the capture node
+      // reads from `src` independently), so toggling monitor mid-take can never alter the recorded audio.
+      // input -> monGain (the toggle) -> master. Starts at the session monitor state (default 0/off).
+      var monGain = self.ctx.createGain(); monGain.gain.value = self._monitorOn ? 1 : 0; src.connect(monGain); monGain.connect(self.master);
+      self._cap = { src: src, silent: silent, monGain: monGain, node: null, chunks: [], frames: 0, qpeaks: [], sr: self.ctx.sampleRate, latency: latency, startedAt: 0, stopped: false, onEngage: null, onDone: null };
+      function wireNode(node, isWorklet) {
+        self._cap.node = node; self._cap.isWorklet = isWorklet;
+        node.port ? (node.port.onmessage = onMsg) : (node.onaudioprocess = onSP);
+        src.connect(node); node.connect(silent);
+        opts.onReady && opts.onReady(latency, self.ctx.sampleRate);
+      }
+      function onMsg(e) {
+        var d = e.data;
+        if (d && d.ev === "started") { self._cap.startedAt = d.at; self._cap.onEngage && self._cap.onEngage(); return; }
+        if (d && d.ev === "stopped") { self._assembleCapture(); return; }
+        if (d && d.length != null) { self._cap.chunks.push(d); self._cap.frames += d.length; self._pushQPeak(d); }
+      }
+      // ScriptProcessor fallback: gate on the audio clock in the main thread.
+      function onSP(ev) {
+        var c = self._cap; if (!c || !c._armed) return;
+        var t = self.ctx.currentTime, inp = ev.inputBuffer.getChannelData(0);
+        if (!c._spStarted && t >= c._spStart) { c._spStarted = true; c.startedAt = t; c.onEngage && c.onEngage(); }
+        if (c._spStarted && t < c._spStop) { var copy = new Float32Array(inp.length); copy.set(inp); c.chunks.push(copy); c.frames += copy.length; self._pushQPeak(copy); }
+        if (c._spStarted && t >= c._spStop) { c._armed = false; self._assembleCapture(); }
+      }
+      if (self.ctx.audioWorklet && typeof AudioWorkletNode !== "undefined") {
+        var url = URL.createObjectURL(new Blob([self._captureWorkletSrc()], { type: "application/javascript" }));
+        self.ctx.audioWorklet.addModule(url).then(function () {
+          URL.revokeObjectURL(url);
+          try { wireNode(new AudioWorkletNode(self.ctx, "pcm-capture", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] }), true); }
+          catch (e) { wireNode(self.ctx.createScriptProcessor(4096, 1, 1), false); }
+        })["catch"](function () { wireNode(self.ctx.createScriptProcessor(4096, 1, 1), false); });
+      } else {
+        wireNode(self.ctx.createScriptProcessor(4096, 1, 1), false);
+      }
+    }
+    // reuse a still-live cached stream (session cache, rule 4) — no re-prompt
+    if (this._micStream && this._micStream.getAudioTracks().some(function (t) { return t.readyState === "live"; })) { proceed(this._micStream); return; }
+    // Fix 1 — RAW signal for music tracking: echoCancellation/noiseSuppression/autoGainControl OFF.
+    // With monitoring ON, the browser echo-canceller "hears" the monitored output as echo and
+    // dynamically ducks/warps the mic track (corrupting BOTH the take and the monitor, since both read
+    // this same processed track). AGC/NS additionally pump/gate a sung/played signal. A tracking DAW
+    // wants the unprocessed input; acoustic speaker feedback stays a user-environment concern (headphones
+    // warning covers it). Booleans (not {ideal:...}) so a UA that can't disable them rejects → onError.
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
+      .then(proceed)["catch"](function (e) { opts.onError && opts.onError(e); });
+  };
+
+  // per-quantum max-abs -> live-waveform envelope source (downsampled at render by capturePeaks)
+  Engine.prototype._pushQPeak = function (chunk) {
+    var m = 0; for (var i = 0; i < chunk.length; i++) { var a = chunk[i] < 0 ? -chunk[i] : chunk[i]; if (a > m) m = a; }
+    this._cap.qpeaks.push(m);
+  };
+  // arm capture to ENGAGE at audio-clock time `atTime` (sample-accurate downbeat). onEngage fires
+  // from the node the instant copying begins; onDone(result) fires when the assembled buffer is ready.
+  Engine.prototype.beginMicCapture = function (atTime, onEngage, onDone) {
+    var c = this._cap; if (!c) return;
+    c.onEngage = onEngage || null; c.onDone = onDone || null; c.chunks = []; c.frames = 0; c.qpeaks = []; c.stopped = false; c.startedAt = 0;
+    if (c.isWorklet) { c._armed = true; c.node.port.postMessage({ cmd: "arm", at: atTime }); }
+    else { c._armed = true; c._spStarted = false; c._spStart = atTime; c._spStop = Infinity; }
+  };
+  // true only once copying has actually ENGAGED (not merely armed during the count-in)
+  Engine.prototype.isMicCapturing = function () { var c = this._cap; return !!(c && c._armed && !c.stopped && (c.isWorklet ? c.startedAt > 0 : c._spStarted)); };
+  Engine.prototype.isMicArmed = function () { return !!(this._cap && this._cap._armed && !this._cap.stopped); };
+  Engine.prototype.captureElapsed = function () { var c = this._cap; return (c && c.frames) ? c.frames / c.sr : 0; };
+  // downsample the accumulated per-quantum peaks to `cols` buckets for the live growing waveform
+  Engine.prototype.capturePeaks = function (cols) {
+    var c = this._cap; if (!c || !c.qpeaks.length) return [];
+    cols = cols || Math.min(600, c.qpeaks.length); var out = [], n = c.qpeaks.length;
+    for (var i = 0; i < cols; i++) { var a = Math.floor(i / cols * n), b = Math.floor((i + 1) / cols * n), m = 0; for (var j = a; j < b; j++) if (c.qpeaks[j] > m) m = c.qpeaks[j]; out.push(m); }
+    return out;
+  };
+  // stop capture; the node posts 'stopped' -> _assembleCapture builds the AudioBuffer + calls onDone.
+  Engine.prototype.stopMicCapture = function (onDone) {
+    var c = this._cap; if (!c) { onDone && onDone(null); return; }
+    if (onDone) c.onDone = onDone;
+    if (c.isWorklet) { c.node.port.postMessage({ cmd: "stop" }); }
+    else { c._spStop = this.ctx.currentTime; if (!c._spStarted) this._assembleCapture(); }
+  };
+  // abort with NO clip produced (count-in cancel). Keeps the stream cached for the session.
+  Engine.prototype.cancelMicCapture = function () {
+    var c = this._cap; if (!c) return; c.stopped = true; c.onDone = null; c.onEngage = null;
+    if (c.isWorklet && c.node) { try { c.node.port.postMessage({ cmd: "disarm" }); } catch (e) {} }
+    else if (c) { c._armed = false; }
+    c.chunks = []; c.frames = 0; c.qpeaks = [];
+  };
+  // assemble captured Float32 chunks into a mono AudioBuffer at the ctx sample rate, fire onDone.
+  Engine.prototype._assembleCapture = function () {
+    var c = this._cap; if (!c || c.stopped) return; c.stopped = true;
+    var frames = c.frames, done = c.onDone; var res = null;
+    if (frames > 0) {
+      var buf = this.ctx.createBuffer(1, frames, c.sr), out = buf.getChannelData(0), off = 0;
+      c.chunks.forEach(function (ch) { out.set(ch, off); off += ch.length; });
+      res = { buffer: buf, durSec: frames / c.sr, latencySec: c.latency, startedAt: c.startedAt };
+    }
+    done && done(res);
+  };
+  // input-monitoring toggle (Rec-Audio enhancement, decision 2). Ramps the parallel monitor tap
+  // (input -> monGain -> master) 0<->1 with an 8ms de-click. `on` is remembered on the engine so the
+  // next armMicCapture re-applies it. The capture buffer is unaffected (it reads from a separate node).
+  Engine.prototype.setMonitor = function (on) {
+    this._monitorOn = !!on;
+    var c = this._cap;
+    if (c && c.monGain) { var t = this.ctx.currentTime; c.monGain.gain.cancelScheduledValues(t); c.monGain.gain.setTargetAtTime(on ? 1 : 0, t, 0.008); }
+  };
+  Engine.prototype.isMonitorOn = function () { return !!this._monitorOn; };
+  // release the cached mic stream + capture nodes (session end / teardown)
+  Engine.prototype.releaseMic = function () {
+    var c = this._cap;
+    if (c) { try { c.src.disconnect(); } catch (e) {} try { if (c.node) c.node.disconnect(); } catch (e) {} try { c.silent.disconnect(); } catch (e) {} try { if (c.monGain) c.monGain.disconnect(); } catch (e) {} }
+    if (this._micStream) { try { this._micStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {} }
+    this._micStream = null; this._cap = null;
   };
 
   // ---- MIDI / keyboard performance input (Phase 4A) -------------------------
@@ -1134,14 +1323,28 @@
   // Mode-scoped audibility (Layout/Scoped delta): ONE shared clock; the scheduler only SOUNDS the
   // active tab's channel set. Producer → everything except backing (steps/synth/polySampler/samplers/
   // melody audio lanes). Rec Audio → backing/Project + audio lanes only. uiMuted tracks excluded.
+  // ---- workspace isolation (Studio Isolation build) -------------------------
+  // Every track def carries an explicit `workspace` tag ('producer' | 'studio') set at creation.
+  // This is the SINGLE source of truth for which mode owns a track — voice-`type` cannot tell a
+  // Producer melody-import audio lane (addMelodyFile) from a Studio rec lane (addAudioTrack): both
+  // are type:'audio'/kind:'audioLane'. Producer and Studio read cleanly-separated collections via
+  // producerDefs()/studioDefs() (one physical id-keyed array underneath; banks/clips/routes/inserts
+  // stay untouched). _workspaceOf() has a legacy fallback for any def predating the tag.
+  Engine.prototype._workspaceOf = function (d) {
+    if (!d) return "producer";
+    if (d.workspace === "producer" || d.workspace === "studio") return d.workspace;
+    if (d.trackType === "backing" || d.backing || d.locked) return "studio";   // backing always Studio
+    return "producer";
+  };
+  Engine.prototype.producerDefs = function () { var self = this; return this.channelDefs.filter(function (d) { return self._workspaceOf(d) === "producer"; }); };
+  Engine.prototype.studioDefs = function () { var self = this; return this.channelDefs.filter(function (d) { return self._workspaceOf(d) === "studio"; }); };
+
   // Set `engine._recMode` from the App (false = Producer, true = Rec Audio). Never forks the transport.
+  // Mode scope now reads the workspace tag directly (cleanly-separated sources), not a type heuristic.
   Engine.prototype._inModeScope = function (id) {
     var ch = this.channels[id]; if (!ch) return true; var d = ch.def; if (!d) return true;
     if (d.uiMuted) return false;                                   // muted tracks stay excluded
-    var backing = d.trackType === "backing" || d.backing || d.locked;
-    var audioLane = d.type === "audio" || d.kind === "audioLane";
-    if (this._recMode) return backing || audioLane;               // Rec Audio: backing + audio lanes
-    return !backing;                                              // Producer: all non-backing content
+    return this._workspaceOf(d) === (this._recMode ? "studio" : "producer");
   };
   Engine.prototype._fireEvent = function (ev, time) {
     if (!this._audible(ev.ch)) return;
@@ -1490,7 +1693,7 @@
     var maxRoute = 0; this.channelDefs.forEach(function (c) { if (c.route > maxRoute) maxRoute = c.route; });
     var route = Math.min(16, maxRoute + 1);
     var def = { id: id, label: src.label + (n > 1 ? " " + n : ""), type: src.type, color: src.color,
-                route: route, vol: src.vol, pan: 0, tonal: src.tonal, base: src.base, sampleId: src.id };
+                route: route, vol: src.vol, pan: 0, tonal: src.tonal, base: src.base, sampleId: src.id, workspace: "producer" };
     this.channelDefs.push(def);
     // add a fresh step row for this channel in EVERY bank
     this.banks.forEach(function (bk) { bk.steps[id] = freshStepRow(patLen(bk)); });
@@ -1507,7 +1710,7 @@
     var n = 1, id = "syn"; while (this.channels[id]) { id = "syn_" + (++n); }
     var maxRoute = 0; this.channelDefs.forEach(function (c) { if (c.route > maxRoute) maxRoute = c.route; });
     var def = { id: id, label: name || ("Synth" + (n > 1 ? " " + n : "")), type: "synth", kind: "synth", color: "#9d4edd",
-                route: Math.min(16, maxRoute + 1), vol: 0.7, pan: 0, tonal: true, base: 60,
+                route: Math.min(16, maxRoute + 1), vol: 0.7, pan: 0, tonal: true, base: 60, workspace: "producer",
                 synth: { wave: wave || "sawtooth", attack: 0.005, decay: 0.12, sustain: 0.7, release: 0.08 } };
     this.channelDefs.push(def);
     this.banks.forEach(function (bk) { bk.steps[id] = freshStepRow(patLen(bk)); });
@@ -1549,7 +1752,7 @@
     this.channelDefs.slice().forEach(function (c) { self.removeChannel(c.id); });
     this._catalog.forEach(function (c) {
       var def = { id: c.id, label: c.label, type: c.type, color: c.color, route: c.route,
-                  vol: c.vol, pan: c.pan, tonal: c.tonal, base: c.base, sampleId: c.id };
+                  vol: c.vol, pan: c.pan, tonal: c.tonal, base: c.base, sampleId: c.id, workspace: "producer" };
       self.channelDefs.push(def);
       self.banks.forEach(function (bk) { if (!bk.steps[c.id]) bk.steps[c.id] = freshStepRow(patLen(bk)); });
       self._wireChannel(def);
@@ -1722,6 +1925,7 @@
           var reps = fb > 0.01 ? (3 / Math.log10(1 / fb)) : 1;   // repeats to ~ -60 dB
           var tl = t * reps; if (tl > fxTail) fxTail = tl;
         } else if (s.type === "chorus") { if (0.1 > fxTail) fxTail = 0.1; }
+        else if (s.type === "reverb") { var rt = 0.4 + (s.params.size != null ? s.params.size : 0.6) * 3.6; if (rt > fxTail) fxTail = rt; }   // Fix 2: reverb tail rings out in the bounce
       });
     });
     var tail = Math.min(12, Math.max(1.8, fxTail + 0.3));
@@ -1749,18 +1953,22 @@
       comp.attack.value = 0.005; comp.release.value = 0.15;   // F1: match live insert init (was WebAudio defaults 0.003/0.25)
       var filt = octx.createBiquadFilter(); filt.type = "lowpass"; filt.frequency.value = 20000; filt.Q.value = 0.7;
       var dry = octx.createGain(); var dl = octx.createDelay(1.5); var fb = octx.createGain(); var wet = octx.createGain();
+      var conv = octx.createConvolver(); var rvWet = octx.createGain(); rvWet.gain.value = 0;   // Fix 2: mirror the live reverb send offline
       var fader = octx.createGain(); fader.gain.value = live.mute ? 0 : live.vol;
       var pan = octx.createStereoPanner ? octx.createStereoPanner() : null; if (pan) pan.pan.value = live.panVal;
-      var bitS = null, filtS = null, delayish = null, compS = null;
-      live.fx.forEach(function (s) { if (!s.type || s.bypass) return; if (s.type === "bitcrush") bitS = s; else if (s.type === "filter") filtS = s; else if (s.type === "delay" || s.type === "chorus") delayish = s; else if (s.type === "comp") compS = s; });
+      var bitS = null, filtS = null, delayish = null, compS = null, reverbS = null;
+      live.fx.forEach(function (s) { if (!s.type || s.bypass) return; if (s.type === "bitcrush") bitS = s; else if (s.type === "filter") filtS = s; else if (s.type === "delay" || s.type === "chorus") delayish = s; else if (s.type === "comp") compS = s; else if (s.type === "reverb") reverbS = s; });
       bit.curve = bitS ? self._bitCurve(bitS.params.bits) : self._linearCurve();
       if (filtS) { filt.type = filtS.params.mode; filt.frequency.value = filtS.params.freq; filt.Q.value = filtS.params.q; }
       if (compS) { comp.threshold.value = compS.params.thr; comp.ratio.value = compS.params.ratio; } else { comp.threshold.value = 0; comp.ratio.value = 1; }
       dry.gain.value = 1;
-      if (delayish) { if (delayish.type === "chorus") { dl.delayTime.value = 0.022; fb.gain.value = 0.18; wet.gain.value = (delayish.params.mix != null ? delayish.params.mix : 0.4) * 0.6; } else { dl.delayTime.value = delayish.params.time; fb.gain.value = delayish.params.fb; wet.gain.value = (delayish.params.mix != null ? delayish.params.mix : delayish.params.wet) * 0.85; } } else { fb.gain.value = 0; wet.gain.value = 0; }
+      // Fix 2: identical perceptual wet mapping as _applyFx so the bounce matches monitoring.
+      if (delayish) { if (delayish.type === "chorus") { dl.delayTime.value = 0.022; fb.gain.value = 0.22; wet.gain.value = Math.pow((delayish.params.mix != null ? delayish.params.mix : 0.4), 0.6) * 1.1; } else { dl.delayTime.value = delayish.params.time; fb.gain.value = Math.min(0.92, delayish.params.fb); wet.gain.value = Math.pow((delayish.params.mix != null ? delayish.params.mix : delayish.params.wet), 0.6) * 1.25; } } else { fb.gain.value = 0; wet.gain.value = 0; }
+      if (reverbS) { var rsz = reverbS.params.size != null ? reverbS.params.size : 0.6; conv.buffer = self._makeImpulse(0.4 + rsz * 3.6, 1.6 + rsz * 2.6); var rvw = reverbS.params.wet != null ? reverbS.params.wet : (reverbS.params.mix != null ? reverbS.params.mix * 0.8 : 0.24); rvWet.gain.value = Math.pow(rvw / 0.8, 0.55) * 1.7; }
       input.connect(bit); bit.connect(filt); filt.connect(comp);
       comp.connect(dry); comp.connect(dl); dl.connect(fb); fb.connect(dl); dl.connect(wet);
-      dry.connect(fader); wet.connect(fader); fader.connect(pan || master); if (pan) pan.connect(master);
+      comp.connect(conv); conv.connect(rvWet);
+      dry.connect(fader); wet.connect(fader); rvWet.connect(fader); fader.connect(pan || master); if (pan) pan.connect(master);
       insIn[def.id] = input;
     });
     var chOut = {};
@@ -1785,6 +1993,8 @@
       if (soloId && ev.ch !== soloId) return;                 // stem render: isolate one track
       if (!self._audible(ev.ch)) return;
       var c = self.channels[ev.ch]; if (!c) return;
+      if (self._workspaceOf(c.def) !== "producer") return;    // ISOLATION: Producer bounce/master renders Producer content only
+
       var time = self.tickToSec(ev.absTick);
       var out = outFor(ev.ch, ev.routeOverride);
       if (ev.kind === "audio") { var adur = ev.trimmed ? self.tickToSec(ev.lenTicks) : 0; self._playBuffer(octx, self.userBuffers[ev.bufferId], time, out, 0, 100, adur, self.tickToSec(ev.offsetTicks || 0), { gain: ev.gain, fadeIn: self.tickToSec(ev.fadeInTicks || 0), fadeOut: self.tickToSec(ev.fadeOutTicks || 0) }); return; }
@@ -1820,7 +2030,7 @@
     var self = this; this.init();
     var sr = (this.ctx && this.ctx.sampleRate) ? this.ctx.sampleRate : 44100;
     var bpm = this.tempo || 140, spb = 60 / Math.max(40, bpm);
-    var lanes = this.channelDefs.filter(function (c) { return (c.type === "audio" || c.kind === "audioLane") && !c.uiMuted; });
+    var lanes = this.channelDefs.filter(function (c) { return self._workspaceOf(c) === "studio" && !c.uiMuted; });
     var clipsByLane = {}, songTicks = 0, maxDelayTail = 0, any = false;
     lanes.forEach(function (c) {
       var cl = self.timeline.clips.filter(function (x) { return x.ch === c.id && x.kind === "audio"; });
@@ -1870,7 +2080,7 @@
   // ---- multitrack stem export: render each lane solo, package as a (store) ZIP ----
   Engine.prototype._stemName = function (label, i) { return ("0" + (i + 1)).slice(-2) + "_" + String(label || "track").replace(/[^A-Za-z0-9_-]+/g, "_").slice(0, 24) + ".wav"; };
   Engine.prototype.renderStems = function (onProgress, onDone) {
-    var self = this, defs = this.channelDefs.slice();
+    var self = this, defs = this.producerDefs();   // ISOLATION: stems are the Producer arrangement, one WAV per Producer track
     if (!defs.length) { onDone && onDone(null); return; }
     var stems = [], i = 0;
     function next() {
@@ -1958,6 +2168,7 @@
       channels: this.channelDefs.map(function (c) {
         var live = self.channels[c.id] || {};
         return { id: c.id, label: c.label, type: c.type, kind: c.kind || (c.type === "audio" ? "audioLane" : "sampler"), audioLane: !!c.audioLane, color: c.color, route: c.route,
+                 workspace: self._workspaceOf(c),
                  base: c.base, tonal: c.tonal, sampleId: c.sampleId, bufferId: c.bufferId, userAudio: !!c.userAudio, synth: c.synth || null,
                  vol: live.vol != null ? live.vol : c.vol, pan: live.pan != null ? live.pan : c.pan,
                  muted: !!live.muted, solo: !!live.solo };
@@ -2006,9 +2217,17 @@
       while (this.banks.length < 4) this.banks.push(blankPattern());
       // rebuild channels + fresh nodes
       (data.channels || []).forEach(function (c) {
+        var isAudioLane = c.type === "audio" || !!c.audioLane || c.kind === "audioLane";
+        // workspace migration: new saves carry `workspace` verbatim. Legacy saves (no tag) are routed —
+        // non-audio kinds -> producer; an audio lane is producer only if it already carries an audio clip
+        // (a melody import always does; a Studio rec lane is empty since RECORD is stubbed) else studio.
+        // Backing lanes are corrected to studio by restoreStudioSave() after hydrate.
+        var ws = (c.workspace === "producer" || c.workspace === "studio") ? c.workspace
+               : (!isAudioLane ? "producer"
+                  : ((data.timeline && data.timeline.clips || []).some(function (cl) { return cl.ch === c.id && cl.kind === "audio"; }) ? "producer" : "studio"));
         var def = { id: c.id, label: c.label, type: c.type, kind: c.kind || (c.type === "audio" ? "audioLane" : "sampler"), color: c.color, route: c.route,
-                    vol: c.vol, pan: c.pan, tonal: c.tonal, base: c.base, sampleId: c.sampleId,
-                    bufferId: c.bufferId || c.id, userAudio: !!c.userAudio, audioLane: c.type === "audio" || !!c.audioLane,
+                    vol: c.vol, pan: c.pan, tonal: c.tonal, base: c.base, sampleId: c.sampleId, workspace: ws,
+                    bufferId: c.bufferId || c.id, userAudio: !!c.userAudio, audioLane: isAudioLane,
                     synth: (c.kind === "synth" || c.type === "synth" || c.kind === "polySampler") ? (c.synth || { wave: "sawtooth", attack: 0.005, decay: 0.12, sustain: 0.7, release: 0.08 }) : null };
         self.channelDefs.push(def);
         self.banks.forEach(function (bk) { if (!bk.steps[c.id]) bk.steps[c.id] = freshStepRow(patLen(bk)); });

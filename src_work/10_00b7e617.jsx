@@ -68,7 +68,7 @@
       h("div", { className: "t-group" },
         h("button", { className: "tbtn play" + (props.playing ? " on" : ""), onClick: props.onPlay }, props.playing ? h(I.Stop, null) : h(I.Play, null)),
         h("button", { className: "tbtn", onClick: props.onStop, title: "Stop" }, h(I.Stop, { width: 16, height: 16 })),
-        h("button", { className: "tbtn rec", title: "Record (armed)" }, h(I.Rec, { width: 14, height: 14 }))),
+        h("button", { className: "tbtn rec", title: "Record — Rec Audio mode" }, h(I.Rec, { width: 14, height: 14 }))),
       h("div", { className: "t-group" },
         h("div", { className: "readout clock" }, h("span", { className: "lbl" }, "Position"), h("span", { className: "val mono" }, props.pos))),
       h("div", { className: "t-group" },
@@ -535,6 +535,50 @@
     return h("canvas", { className: "lane-wave", ref: ref });
   }
 
+  // MM:SS clock (ruler labels — no ms)
+  function fmtClock(sec) { if (!(sec > 0)) sec = 0; var m = Math.floor(sec / 60), s = Math.floor(sec % 60); return (m < 10 ? "0" + m : m) + ":" + (s < 10 ? "0" + s : s); }
+
+  // Rec-Audio session timer (decision 4): MM:SS.cs, driven off the transport clock. Updates imperatively
+  // via rAF while active (playing/recording) so it never forces a per-frame React re-render; when idle it
+  // reflects the current transport position (playheadTick), so a scrub/stop shows the new position.
+  function StudioTimer(props) {
+    var ref = useRef(null);
+    useEffect(function () {
+      var el = ref.current; if (!el) return;
+      function fmt(sec) { if (!(sec > 0)) sec = 0; var m = Math.floor(sec / 60), s = Math.floor(sec % 60), cs = Math.floor(sec * 100) % 100; return (m < 10 ? "0" + m : m) + ":" + (s < 10 ? "0" + s : s) + "." + (cs < 10 ? "0" + cs : cs); }
+      function pos() { var pt = window.engine.playheadTick; return pt >= 0 ? window.engine.tickToSec(pt) : 0; }
+      var raf = 0, dead = false;
+      function loop() { if (dead) return; el.textContent = fmt(pos()); raf = requestAnimationFrame(loop); }
+      // active (play/record) = live rAF off the transport clock. Otherwise show the frozen `staticSec`
+      // (count-in freezes at the red-line position; idle reflects the current transport position).
+      if (props.active) loop(); else el.textContent = fmt(props.staticSec != null ? props.staticSec : pos());
+      return function () { dead = true; if (raf) cancelAnimationFrame(raf); };
+    }, [props.active, props.staticSec, props.rev, props.playTick]);
+    return h("div", { className: "studio-timer mono", ref: ref, "aria-label": "Session time" }, "00:00.00");
+  }
+
+  // Rec-Audio timeline ruler (decision 4): 00:00 → session max. Progress + head sync with the transport;
+  // click/drag the track scrubs via the SAME shared handler the lane playhead uses. Turns red while a take
+  // is recording (write-position), purple during/after playback. `fitTicks` is the shared auto-fit scale.
+  function StudioRuler(props) {
+    var trackRef = useRef(null);
+    var fit = Math.max(1, props.fitTicks || 1);
+    var totalSec = window.engine.tickToSec(fit);
+    var recording = props.recording;
+    var recFrac = (recording && props.recPos >= 0) ? Math.max(0, Math.min(1, props.recPos / fit)) : -1;
+    var playFrac = (!recording && props.playTick >= 0) ? Math.max(0, Math.min(1, props.playTick / fit)) : -1;
+    var step = totalSec > 120 ? 20 : totalSec > 60 ? 10 : totalSec > 20 ? 5 : totalSec > 8 ? 2 : 1;
+    var marks = []; for (var s = step; s < totalSec - 0.01; s += step) marks.push(s);
+    function down(e) { props.dragScrub(e, function (ev) { var r = trackRef.current.getBoundingClientRect(); return (ev.clientX - r.left) / Math.max(1, r.width); }); }
+    return h("div", { className: "studio-ruler" },
+      h("span", { className: "sr-gutter mono" }, "00:00"),
+      h("div", { className: "sr-track", ref: trackRef, onMouseDown: down, title: "Session timeline — click or drag to scrub" },
+        marks.map(function (mk, i) { return h("div", { key: i, className: "sr-mark", style: { left: (mk / totalSec * 100) + "%" } }, h("span", { className: "sr-mlbl mono" }, fmtClock(mk))); }),
+        recFrac >= 0 ? h("div", { className: "sr-prog rec", style: { width: (recFrac * 100) + "%" } }) : (playFrac >= 0 ? h("div", { className: "sr-prog", style: { width: (playFrac * 100) + "%" } }) : null),
+        recFrac >= 0 ? h("div", { className: "sr-head rec", style: { left: (recFrac * 100) + "%" } }) : (playFrac >= 0 ? h("div", { className: "sr-head", style: { left: (playFrac * 100) + "%" } }) : null)),
+      h("span", { className: "sr-gutter right mono" }, fmtClock(totalSec)));
+  }
+
   // left panel: track-source manager (Import section hidden in Rec Audio; lives in Producer only)
   function TrackSourceManager(props) {
     var upRef = useRef(null);
@@ -566,60 +610,120 @@
           : h("div", { className: "st-empty" }, "No tracks yet — Add Producer Track or Add Track.")));
   }
 
-  // center-top: audio-lane matrix (read-only waveforms) + inline [M]/[✕] + arm-on-click + Add Track
+  // center-top: audio-lane matrix (read-only waveforms) + Add Track. Selecting a lane makes it the
+  // record target + Plugins focus (dropdown = single authority; no arming).
   function AudioLaneMatrix(props) {
     var lanes = props.tracks;
-    var songTicks = Math.max(1, E.timeline.lengthTicks || 1);
-    var phPct = (props.playing && props.playTick >= 0) ? Math.max(0, Math.min(100, (props.playTick / songTicks) * 100)) : -1;
+    var fit = Math.max(1, props.fitTicks || 1);
+    var lanesRef = useRef(null);
+    // frac (0..1) of the lane CONTENT column (after the 220px head + 12px pad each side) from a clientX.
+    // Matches the playhead-line CSS mapping below so the line sits exactly under the pointer.
+    function laneFrac(clientX) {
+      var el = lanesRef.current; if (!el) return 0;
+      var r = el.getBoundingClientRect(), left = r.left + 12 + 220, right = r.right - 12, w = Math.max(1, right - left);
+      return Math.max(0, Math.min(1, (clientX - left) / w));
+    }
+    function pct(t) { return (Math.max(0, t) / fit * 100) + "%"; }
+    // playhead x within .sm-lanes (padding box): content starts at 12+220=232px, ends at 100%-12px.
+    function phLeft(frac) { return { left: "calc(232px + (100% - 244px) * " + Math.max(0, Math.min(1, frac)) + ")" }; }
+    var recording = props.recPhase === "recording";
+    var countin = props.recPhase === "countin";
+    var recPos = (recording && props.recPreview) ? (props.recPreview.startTick + props.recPreview.lengthTicks) : -1;
+    // RED record line (decision 3): ALWAYS present. While recording it's the moving write head (recPos,
+    // not draggable); otherwise it sits at the punch-in position (recStartTick) and is draggable — but
+    // NOT during count-in (decision 2: red holds still until the downbeat). PURPLE (decision 3) = playback
+    // position, scrubbable, shown only during/after playback — hidden during count-in + recording. The
+    // two lines are distinct and can coexist when idle (red = punch-in, purple = last playback position).
+    var redTick = recording ? (recPos >= 0 ? recPos : (props.recStartTick || 0)) : (props.recStartTick || 0);
+    var redDraggable = !recording && !countin;
+    var showPurple = !recording && !countin && props.playTick != null && props.playTick >= 0;
     return h("div", { className: "studio-matrix" },
       h("div", { className: "sm-head" },
         h("span", { className: "pt" }, "Audio Tracking"),
-        h("span", { className: "sub" }, "Arm a lane, then hit RECORD · " + lanes.length + " lane" + (lanes.length === 1 ? "" : "s")),
+        h("span", { className: "sub" }, "Drag the red line to set punch-in · select a track, then RECORD · " + lanes.length + " lane" + (lanes.length === 1 ? "" : "s")),
         h("button", { className: "sm-addtrack", onClick: props.onAddTrack }, h(I.Plus, { width: 14, height: 14 }), "Add Track")),
-      h("div", { className: "sm-lanes" },
-        phPct >= 0 ? h("div", { className: "sm-playhead", style: { left: "calc(220px + (100% - 220px) * " + (phPct / 100) + ")" } }) : null,
+      h("div", { className: "sm-lanes", ref: lanesRef, onMouseDown: function (e) { if (e.target.classList.contains("sm-lanes")) props.onSelectClip(null); } },
+        showPurple ? h("div", { className: "sm-playhead play", style: phLeft(props.playTick / fit), title: "Playback position — drag to scrub",
+          onMouseDown: function (e) { props.dragScrub(e, function (ev) { return laneFrac(ev.clientX); }); } }) : null,
+        h("div", { className: "sm-playhead rec" + (redDraggable ? " grab" : ""), style: phLeft(redTick / fit),
+          title: recording ? "Recording — write position" : "Record-start (punch-in) — drag to move",
+          onMouseDown: redDraggable ? function (e) { props.dragRed(e, function (ev) { return laneFrac(ev.clientX); }); } : null }),
         lanes.length
           ? lanes.map(function (c) {
               var clips = E.timeline.clips.filter(function (cl) { return cl.ch === c.id && cl.kind === "audio"; });
-              var clip = clips[0];
-              var isArmed = props.armed === c.id;
               var backing = isBackingDef(c);
               var muted = !!c.uiMuted;
-              return h("div", { key: c.id, className: "sm-lane" + (props.selected === c.id ? " sel" : "") + (isArmed ? " armed" : "") + (backing ? " locked" : "") + (muted ? " muted" : ""), onClick: function () { props.onSelect(c.id, true); } },
+              var live = props.recPreview && props.recPreview.ch === c.id ? props.recPreview : null;
+              return h("div", { key: c.id, className: "sm-lane" + (props.selected === c.id ? " sel" : "") + (backing ? " locked" : "") + (muted ? " muted" : ""), onClick: function () { props.onSelect(c.id, true); }, onDoubleClick: function () { if (clips[0] && !backing && props.onOpenTake) props.onOpenTake(clips[0]); } },
                 h("div", { className: "sm-lanehead" },
                   h("span", { className: "sm-dot", style: { background: c.color || "var(--accent)" } }),
                   h("span", { className: "sm-lname" }, c.label),
-                  // M/✕/↻ consolidated to the left TRACKS list — lane headers keep only name + ARM state.
+                  // M/✕/↻ consolidated to the left TRACKS list — lane headers keep only name + (backing) badge.
                   backing
                     ? h("span", { className: "sm-badge lock", title: "PROJECT — BACKING (READ ONLY) · Rendered mixdown. To update, re-bounce or upload a new backing." }, "PROJECT — BACKING")
-                    : h("button", { className: "sm-arm" + (isArmed ? " on" : ""), "aria-label": isArmed ? "Disarm track" : "Arm track", onClick: function (e) { e.stopPropagation(); props.onArm(isArmed ? null : c.id); }, title: "Arm this lane for recording" }, isArmed ? "ARMED" : "ARM")),
-                h("div", { className: "sm-lanebody" + (clip ? "" : " empty"), onClick: function (e) { if (!clip && !backing) { e.stopPropagation(); props.onArm(c.id); } } },
-                  clip ? h(LaneWave, { peaks: clip.peaks, color: backing ? "rgba(199,125,255,0.9)" : "rgba(157,78,221,0.95)", rev: props.rev }) : h("span", { className: "sm-emptyhint" }, isArmed ? "Armed — RECORD is stubbed this build" : "Empty lane — click to arm")));
+                    : (props.selected === c.id ? h("span", { className: "sm-badge sel", title: "Selected — the RECORD target" }, "REC TARGET") : null)),
+                // auto-fit lane body: every clip is time-positioned by the SHARED scale (left/width = % of
+                // fitTicks), so a given x = the same timestamp on every lane. No horizontal overflow.
+                h("div", { className: "sm-lanebody" + ((clips.length || live) ? "" : " empty"), onClick: function (e) { if (!clips.length && !live && !backing) { e.stopPropagation(); props.onSelect(c.id, true); } } },
+                  clips.map(function (cl) {
+                    // interactive clip (decision 4): click select · drag move (same lane, snapped) · Ctrl+C/V.
+                    // Backing/Project clips are inert (no mousedown handler, no selection).
+                    return h("div", { key: cl.id, className: "sm-clip" + (backing ? " backing" : "") + (!backing && props.selClip === cl.id ? " sel" : ""), style: { left: pct(cl.startTick), width: pct(cl.lengthTicks) },
+                      onMouseDown: backing ? null : function (e) { props.onClipDown(e, cl); } },
+                      h(LaneWave, { peaks: cl.peaks, color: backing ? "rgba(199,125,255,0.9)" : "rgba(157,78,221,0.95)", rev: props.rev + ":" + fit }));
+                  }),
+                  live ? h("div", { className: "sm-clip live", style: { left: pct(live.startTick), width: pct(live.lengthTicks) } }, h(LaneWave, { peaks: live.peaks, color: "rgba(255,59,107,0.95)", rev: (live.peaks || []).length })) : null,
+                  (!clips.length && !live) ? h("span", { className: "sm-emptyhint" }, backing ? "Backing track" : "Empty lane — select as record target") : null));
             })
           : h("div", { className: "sm-noneyet" }, "No audio lanes. Add a track or Add Producer Track to start tracking.")));
   }
 
   // bottom bar LEFT zone: large circular Record with animated sound-wave rings (dominant element),
-  // RECORD label beneath; mini Play/Stop + master VU + armed readout subordinate.
+  // RECORD label beneath; mini Play/Stop + master VU + record-target readout subordinate.
+  // RECORD gating (locked decision 5): enabled whenever the dropdown-selected track is an editable,
+  // unlocked track. A backing selection disables RECORD ("read-only") — the ONLY remaining gate, since
+  // the dropdown legitimately lists locked backing entries and a truly ungated RECORD could route a
+  // take into the baked reference mix. Selection replaces arming as the record target.
   function RecordBar(props) {
-    var armed = !!props.armed;
-    var d = armed && E.channels[props.armed] ? E.channels[props.armed].def : null;
-    return h("div", { className: "rec-zone" },
-      h("div", { className: "rz-ttl" }, "TRANSPORT"),
-      // centerpiece: the circular Record button + rings + label, centered in the zone's free space
+    var d = props.selected && E.channels[props.selected] ? E.channels[props.selected].def : null;
+    var backing = isBackingDef(d);
+    var canRec = !!d && !backing;
+    var phase = props.recPhase || "idle";                     // 'idle' | 'countin' | 'recording'
+    var active = phase !== "idle";                            // count-in or recording in progress
+    // idle: enabled only for an editable selected target. During count-in/recording the button is
+    // always active (a press stops/cancels). States: idle-hot / pending (count-in) / recording.
+    var clickable = active || canRec;
+    var stateCls = phase === "recording" ? " rec-on" : phase === "countin" ? " pending" : (canRec ? " hot" : "");
+    var title = phase === "recording" ? "Stop recording" : phase === "countin" ? "Cancel count-in" : (canRec ? ("Record to " + d.label) : backing ? "Backing track is read-only" : "Select a track to enable recording");
+    var readout = props.recErr ? props.recErr
+      : phase === "recording" ? ("Recording: " + (d ? d.label : "") )
+      : phase === "countin" ? ("Count-in " + Math.min(4, props.countBeat || 1) + " / 4 — get ready…")
+      : canRec ? ("Recording target: " + d.label) : backing ? "Backing track is read-only" : "Select a track";
+    // timer: live rAF while playing/recording; FROZEN at the red-line position during count-in
+    // (decision 2); idle reflects the current transport position.
+    var timerLive = props.playing || phase === "recording";
+    var timerStatic = phase === "countin" ? E.tickToSec(props.recStartTick || 0)
+      : (props.playTick != null && props.playTick >= 0 ? E.tickToSec(props.playTick) : 0);
+    return h("div", { className: "rec-zone" + (active ? " active" : "") },
+      h("div", { className: "rz-header" },
+        h("span", { className: "rz-ttl" }, "TRANSPORT"),
+        h(StudioTimer, { active: timerLive, staticSec: timerStatic, rev: props.rev, playTick: props.playTick })),
       h("div", { className: "rec-center" },
-        h("div", { className: "rec-circle-wrap" + (armed ? " armed" : "") },
+        h("div", { className: "rec-circle-wrap" + stateCls },
           h("span", { className: "rec-ring r1" }), h("span", { className: "rec-ring r2" }), h("span", { className: "rec-ring r3" }),
-          h("button", { className: "rec-circle" + (armed ? " armed" : ""), disabled: !armed, onClick: function () { if (armed) props.onRecord(); }, title: armed ? "Record to armed tracks" : "Arm an unlocked track to enable recording", "aria-label": "Record" },
-            h("span", { className: "rec-circle-dot" }))),
-        h("div", { className: "rec-circle-label" }, "RECORD")),
-      // subordinate transport controls + armed readout at the bottom of the zone
+          h("button", { className: "rec-circle" + stateCls, disabled: !clickable, onClick: function () { if (clickable) props.onRecord(); }, title: title, "aria-label": "Record" },
+            phase === "countin" ? h("span", { className: "rec-count-num" }, String(Math.min(4, props.countBeat || 1))) : h("span", { className: "rec-circle-dot" }))),
+        h("div", { className: "rec-circle-label" }, phase === "recording" ? "STOP" : phase === "countin" ? "COUNT-IN" : "RECORD")),
       h("div", { className: "rz-foot" },
         h("div", { className: "rz-mini" },
           h("button", { className: "rz-play" + (props.playing ? " on" : ""), onClick: props.onPlay, title: props.playing ? "Pause" : "Play", "aria-label": props.playing ? "Pause" : "Play" }, props.playing ? h(I.Stop, { width: 12, height: 12 }) : h(I.Play, { width: 12, height: 12 })),
           h("button", { className: "rz-stop", onClick: props.onStop, title: "Stop", "aria-label": "Stop" }, h(I.Stop, { width: 10, height: 10 })),
+          // input-monitoring toggle (decision 1: moved here, beside Play/Stop, same size). Parallel mic
+          // tap -> master; default OFF; ON warns about speaker feedback. Behavior unchanged from before.
+          h("button", { className: "rz-mon" + (props.monitor ? " on" : ""), onClick: props.onToggleMonitor, "aria-label": "Toggle input monitoring",
+            title: props.monitor ? "Input monitoring ON — you hear your mic input (use headphones)" : "Monitor input — hear your mic in real time. Use headphones; monitoring through speakers will feed back." }, h(I.Headphones, { width: 13, height: 13 })),
           h("div", { className: "rz-vu" }, h(W.MeterBar, { master: true, idx: 0 }), h(W.MeterBar, { master: true, idx: 1 }))),
-        h("div", { className: "rz-state" }, armed ? ("Armed: " + (d ? d.label : "") + " · capture preview (Sprint B)") : "No track armed")));
+        h("div", { className: "rz-state" + (props.recErr ? " err" : "") }, readout)));
   }
 
   function StudioMode(props) {
@@ -627,11 +731,12 @@
     return h("div", { className: "studio" },
       h(TrackSourceManager, { tracks: tracks, selected: props.selected, bouncing: props.bouncing, bounceProg: props.bounceProg, onBounce: props.onBounce, onUpload: props.onUpload, onSelect: props.onSelect, onMute: props.onMute, onDelete: props.onDelete, onReplace: props.onReplace }),
       h("div", { className: "studio-center" },
-        h(AudioLaneMatrix, { tracks: tracks, selected: props.selected, armed: props.armed, playing: props.playing, playTick: props.playTick, rev: props.rev, onArm: props.onArm, onSelect: props.onSelect, onAddTrack: props.onAddTrack }),
+        h(AudioLaneMatrix, { tracks: tracks, selected: props.selected, playing: props.playing, playTick: props.playTick, rev: props.rev, fitTicks: props.fitTicks, recPhase: props.recPhase, recPreview: props.recPreview, recStartTick: props.recStartTick, selClip: props.selClip, dragScrub: props.dragScrub, dragRed: props.dragRed, onClipDown: props.onClipDown, onSelectClip: props.onSelectClip, onSelect: props.onSelect, onAddTrack: props.onAddTrack, onOpenTake: props.onOpenTake }),
+        h(StudioRuler, { fitTicks: props.fitTicks, playTick: props.playTick, recording: props.recPhase === "recording", recPos: (props.recPreview ? (props.recPreview.startTick + props.recPreview.lengthTicks) : -1), dragScrub: props.dragScrub }),
         h("div", { className: "studio-bottombar" },
-        h(RecordBar, { armed: props.armed, onRecord: props.onRecord, playing: props.playing, onPlay: props.onPlay, onStop: props.onStop }),
+        h(RecordBar, { selected: props.selected, onRecord: props.onRecord, playing: props.playing, onPlay: props.onPlay, onStop: props.onStop, recPhase: props.recPhase, countBeat: props.countBeat, recErr: props.recErr, rev: props.rev, playTick: props.playTick, recStartTick: props.recStartTick, monitor: props.monitor, onToggleMonitor: props.onToggleMonitor }),
         window.StudioPlugins
-          ? h(window.StudioPlugins, { tracks: tracks, selected: props.selected, armed: props.armed, followArmed: props.followArmed, bpm: props.bpm, rev: props.rev, triplet: props.triplet, bouncing: props.bouncing, onSelect: props.onSelect, onToggleFollow: props.onToggleFollow, onMute: props.onMute, onDelete: props.onDelete, onReplace: props.onReplace, commit: props.commit })
+          ? h(window.StudioPlugins, { tracks: tracks, selected: props.selected, bpm: props.bpm, rev: props.rev, triplet: props.triplet, bouncing: props.bouncing, onSelect: props.onSelect, onMute: props.onMute, onDelete: props.onDelete, onReplace: props.onReplace, commit: props.commit })
           : null)));
   }
 
@@ -652,7 +757,6 @@
     var ptk = useState(-1); var playTick = ptk[0], setPlayTick = ptk[1];   // timeline playhead (ticks)
     var mtS = useState(false); var musTyping = mtS[0], setMusTyping = mtS[1];   // ASDF musical typing
     var miS = useState(false); var midiOn = miS[0], setMidiOn = miS[1];         // Web MIDI enabled
-    var paS = useState(false); var perfArm = paS[0], setPerfArm = paS[1];       // note-record arm
     var musRef = useRef(false), octRef = useRef(0);                             // live mirrors for the global key handler
     var cpS = useState(false); var paletteOpen = cpS[0], setPaletteOpen = cpS[1];
     var tlS = useState("arrow"); var toolMode = tlS[0], setToolMode = tlS[1];   // timeline tool: arrow | marquee
@@ -687,13 +791,25 @@
     var T = useToasts(); var toasts = T[0], toast = T[1];
     // Studio Mode (Build 1): [Producer] | [Rec Audio] layout switch beneath the top bar
     var stM = useState(false); var studio = stM[0], setStudio = stM[1];
-    var stSel = useState(null); var studioSel = stSel[0], setStudioSel = stSel[1];   // selected Studio track (chId)
-    var stArm = useState(null); var studioArm = stArm[0], setStudioArm = stArm[1];   // armed Studio lane (chId)
+    var stSel = useState(null); var studioSel = stSel[0], setStudioSel = stSel[1];   // selected Studio track (chId) — also the record target (dropdown = single authority)
     var stB = useState(false); var bouncing = stB[0], setBouncing = stB[1];
     var stBp = useState(0); var bounceProg = stBp[0], setBounceProg = stBp[1];
-    var stFa = useState(false); var followArmed = stFa[0], setFollowArmed = stFa[1];   // Plugins dropdown follows the armed track (one-way); default OFF
     var stDc = useState(null); var delConfirm = stDc[0], setDelConfirm = stDc[1];     // pending delete-confirm {id,label}
+    // Sprint B live mic capture: single cancellable flow state
+    var rpS = useState("idle"); var recPhase = rpS[0], setRecPhase = rpS[1];          // 'idle' | 'countin' | 'recording'
+    var cbS = useState(0); var countBeat = cbS[0], setCountBeat = cbS[1];             // 1..4 count-in flash
+    var rpvS = useState(null); var recPreview = rpvS[0], setRecPreview = rpvS[1];     // live growing take {ch,startTick,lengthTicks,peaks}
+    var reS = useState(null); var recErr = reS[0], setRecErr = reS[1];                // transient capture error readout
+    var recFlowRef = useRef({ raf: 0, timers: [], captureTick: 0, engageTime: 0, cancelled: false });
     var recycleRef = useRef([]);                                                       // session recycle buffer for soft-deleted tracks
+    var monS = useState(false); var monitor = monS[0], setMonitor = monS[1];           // input-monitoring toggle (session state, always OFF on load — decision 2)
+    // studio auto-fit: one shared time->width scale (session max ticks, with headroom). fitTicksRef
+    // mirrors the state so the recording rAF poll reads a fresh value without re-subscribing.
+    var ftS = useState(0); var fitTicks = ftS[0], setFitTicks = ftS[1];
+    var fitTicksRef = useRef(0);
+    var rsS = useState(0); var recStartTick = rsS[0], setRecStartTick = rsS[1];         // movable RED record-start / punch-in position (ticks) — decision 3
+    var scS = useState(null); var selClip = scS[0], setSelClip = scS[1];                // selected Studio clip id — decision 4
+    var studioClipboard = useRef(null);                                                // session clip clipboard (deep-copied clip, shared buffer) — decision 4
     var studioKbdRef = useRef({});                                                     // live mirror for the global key handler (Studio shortcuts)
 
     useEffect(function () {
@@ -707,22 +823,22 @@
         if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
         var ctrlK = e.ctrlKey || e.metaKey;
         if (ctrlK && e.code === "KeyK") { e.preventDefault(); setPaletteOpen(true); return; }
-        // Studio shortcuts (M mute · Del delete · R arm · Ctrl/Cmd+Z undo soft-delete) — take precedence
+        // Studio shortcuts (M mute · Del delete · Ctrl/Cmd+Z undo soft-delete) — take precedence
         // over the Producer hotkeys while Rec Audio is active; input-focus already guarded above.
         var sk = studioKbdRef.current;
         if (sk && sk.studio) {
           if (ctrlK && e.code === "KeyZ" && !e.shiftKey) { e.preventDefault(); sk.undo(); return; }
+          if (ctrlK && e.code === "KeyC") { e.preventDefault(); sk.copy(); return; }        // clip copy (decision 4)
+          if (ctrlK && e.code === "KeyV") { e.preventDefault(); sk.paste(); return; }        // clip paste at the red line
           if (!ctrlK && !e.altKey && !e.shiftKey) {
             if (e.code === "KeyM") { e.preventDefault(); if (sk.sel) sk.mute(sk.sel); return; }
             if (e.code === "Delete" || e.code === "Backspace") { e.preventDefault(); if (sk.sel) sk.del(sk.sel); return; }
-            if (e.code === "KeyR") { e.preventDefault(); if (sk.sel) sk.armfn(sk.sel); return; }
           }
         }
         if (ctrlK && e.code === "KeyZ" && !e.shiftKey) { e.preventDefault(); doUndo(); return; }
         if (ctrlK && (e.code === "KeyY" || (e.code === "KeyZ" && e.shiftKey))) { e.preventDefault(); doRedo(); return; }
-        // single-key tool/transport hotkeys (R arm · V arrow · M marquee) — not musical keys
+        // single-key tool hotkeys (V arrow · M marquee) — not musical keys
         if (!ctrlK && !e.altKey && !e.shiftKey) {
-          if (e.code === "KeyR") { e.preventDefault(); var nx = !E.isPerfArmed(); E.armPerf(nx); setPerfArm(nx); return; }
           if (e.code === "KeyV") { setToolMode("arrow"); return; }
           if (e.code === "KeyM") { setToolMode("marquee"); return; }
         }
@@ -738,7 +854,7 @@
       function onKeyUp(e) { if (!musRef.current) return; var sm = KEYMAP[e.code]; if (sm != null && E.focus) E.perfNoteOff(E.focus, sm + octRef.current * 12); }
       window.addEventListener("keydown", onKey); window.addEventListener("keyup", onKeyUp);
       bump(); E.histInit();
-      return function () { window.removeEventListener("resize", fit); window.removeEventListener("keydown", onKey); window.removeEventListener("keyup", onKeyUp); };
+      return function () { window.removeEventListener("resize", fit); window.removeEventListener("keydown", onKey); window.removeEventListener("keyup", onKeyUp); try { E.releaseMic(); } catch (e) {} };
     }, []);
 
     useEffect(function () {
@@ -843,16 +959,158 @@
     // BEFORE the layout state flips, so no prior-mode audio bleeds under the new screen. Reuses the
     // existing engine.scope lifecycle — no parallel mechanism. The transport itself stays unified.
     function toggleStudio(next) { try { E.scope.stopScopeVoices(); } catch (e) {} E._recMode = next; setStudio(next); }   // mode-scoped playback: engine sounds only the active tab's channel set
+    // input-monitoring toggle (decision 2). Turning ON arms the mic (permission-first) if not already
+    // armed, then routes the parallel monitor tap to master; the capture buffer is never touched.
+    function toggleMonitor() {
+      if (monitor) { E.setMonitor(false); setMonitor(false); return; }
+      function engage() { E.setMonitor(true); setMonitor(true); toast("Input monitoring ON — use headphones (speakers will feed back)", h(I.Headphones, { width: 16, height: 16 })); }
+      if (E._cap && E._cap.monGain) { engage(); return; }               // mic already armed this session — just route
+      E.armMicCapture({ onReady: engage, onError: function () { toast("Microphone access denied — check browser settings", h(I.X, null)); } });
+    }
+
+    // ---- Rec-Audio auto-fit scale + shared scrub (decisions 3, 4, 5) --------------------------
+    // session max ticks across the Studio tracks' clips (end of the longest clip / backing), floored to
+    // 4 bars so an empty session still has a sane width.
+    function studioSessionTicks() {
+      var ids = {}; E.studioDefs().forEach(function (d) { ids[d.id] = 1; });
+      var max = 0;
+      E.timeline.clips.forEach(function (c) { if (ids[c.ch]) { var e = (c.startTick || 0) + (c.lengthTicks || 0); if (e > max) max = e; } });
+      return Math.max(max, E.TICKS_PER_BAR * 4);
+    }
+    // one shared scale for lanes + ruler + playheads. Idle: fit the session exactly (bar-rounded). While a
+    // take records (growing:true) grow only, with 20% headroom in bar chunks, and ONLY when the content
+    // nears the current edge — so a long take re-fits a handful of times, never per animation frame.
+    function refitStudio(opts) {
+      var base = studioSessionTicks();
+      if (opts && opts.extra && opts.extra > base) base = opts.extra;
+      var next;
+      if (opts && opts.growing) {
+        var cur = fitTicksRef.current || 0;
+        if (cur > 0 && base <= cur * 0.98) return cur;                  // still fits — no reflow this frame
+        next = Math.ceil((base * 1.2) / E.TICKS_PER_BAR) * E.TICKS_PER_BAR;
+      } else {
+        next = Math.ceil(base / E.TICKS_PER_BAR) * E.TICKS_PER_BAR;
+      }
+      if (next !== fitTicksRef.current) { fitTicksRef.current = next; setFitTicks(next); }
+      return fitTicksRef.current;
+    }
+    // shared seek: fraction (0..1) of the fitted session -> engine seek + playhead state. SAME path as the
+    // Producer scrub (E.seek + setPlayTick) — not a forked transport.
+    function studioSeekFrac(frac) {
+      var maxT = fitTicksRef.current || studioSessionTicks();
+      var tick = Math.max(0, Math.round(Math.max(0, Math.min(1, frac)) * maxT));
+      E.seek(tick); setPlayTick(tick);
+    }
+    // reused drag-scrub loop (mirrors file-09 dragScrub): mousedown -> live scrub -> release. `fracFn(ev)`
+    // maps a pointer event to a 0..1 fraction (lane content column, or the ruler track).
+    function studioDragScrub(e, fracFn) {
+      if (e.button !== 0) return;
+      e.preventDefault(); e.stopPropagation();
+      function apply(ev) { studioSeekFrac(fracFn(ev)); }
+      apply(e);
+      function mv(ev) { apply(ev); }
+      function up() { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); }
+      window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+    }
+    // keep the shared scale synced to the session while idle (clips added/removed, mode entered, undo).
+    useEffect(function () { if (studio && recPhase !== "recording") refitStudio(); }, [rev, studio, recPhase]);
+    // lightweight re-render during a live drag (no autosave/checkpoint — commit() at drop does that).
+    function forceRender() { rv[1](function (x) { return x + 1; }); }
+
+    // ---- movable RED record-start line (decision 3): drag sets the punch-in tick (NOT the transport) ---
+    // idle-only; snapped to the 1/16 grid; clamped to [0, fit]. Reuses the same drag-loop shape as scrub.
+    function studioDragRed(e, fracFn) {
+      if (e.button !== 0) return;
+      e.preventDefault(); e.stopPropagation();
+      function apply(ev) { var maxT = fitTicksRef.current || studioSessionTicks(); var f = Math.max(0, Math.min(1, fracFn(ev))); setRecStartTick(Math.max(0, E.snapTick(Math.round(f * maxT)))); }
+      apply(e);
+      function mv(ev) { apply(ev); }
+      function up() { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); }
+      window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+    }
+
+    // ---- shared overlap semantic (decision 4): overwrite [startTick,endTick) on a lane, slicing/dropping
+    // overlapped clips (excluding `excludeId`), returning the pre-state `before` snapshot for the recycle
+    // buffer + the surviving `kept` clips. Factored out of placeTake so RECORD, clip-move, and paste share
+    // ONE destructive-through-recycle rule (rule 2 / one consistent overlap semantic everywhere).
+    function overwriteLaneRegion(laneId, startTick, endTick, excludeId) {
+      var before = E.timeline.clips.filter(function (c) { return c.ch === laneId; }).map(function (c) { return JSON.parse(JSON.stringify(c)); });
+      var kept = [];
+      E.timeline.clips.forEach(function (c) {
+        if (c.ch !== laneId) { kept.push(c); return; }      // other lanes: untouched
+        if (c.id === excludeId) { return; }                 // the moved clip itself: caller re-adds it
+        var cs = c.startTick || 0, ce = cs + (c.lengthTicks || 0);
+        if (ce <= startTick || cs >= endTick) { kept.push(c); return; }            // no overlap -> keep
+        if (cs < startTick) { var L = JSON.parse(JSON.stringify(c)); L.id = E._newClipId(); L.lengthTicks = startTick - cs; kept.push(L); }
+        if (ce > endTick) { var R = JSON.parse(JSON.stringify(c)); R.id = E._newClipId(); R.startTick = endTick; R.lengthTicks = ce - endTick; if (R.kind === "audio") R.offsetTicks = (R.offsetTicks || 0) + (endTick - cs); kept.push(R); }
+        // fully-covered clips are dropped (preserved in `before` for undo)
+      });
+      return { before: before, kept: kept };
+    }
+
+    // ---- Producer-style clip interactivity on Rec-Audio lanes (decision 4) ---------------------------
+    // Click selects; left-drag moves the clip along ITS OWN lane, snapped, live; drop commits with the
+    // shared overlap/recycle rule. Reuses the file-09 onClipDown drag-loop pattern (mousedown->mv->up).
+    // Backing/Project lanes are inert (guarded by the caller).
+    function studioClipDown(e, clip) {
+      if (e.button !== 0) return; e.stopPropagation();
+      setSelClip(clip.id);
+      var el = e.currentTarget.closest(".sm-lanes"); if (!el) return;
+      var r = el.getBoundingClientRect(), contentW = Math.max(1, (r.right - 12) - (r.left + 232));
+      var maxT = fitTicksRef.current || studioSessionTicks();
+      var sx = e.clientX, orig = clip.startTick;
+      var pre = E.timeline.clips.filter(function (c) { return c.ch === clip.ch; }).map(function (c) { return JSON.parse(JSON.stringify(c)); });
+      var moved = false;
+      function mv(ev) {
+        var dTick = (ev.clientX - sx) / contentW * maxT;
+        var nt = Math.max(0, E.snapTick(orig + dTick));
+        if (nt !== clip.startTick) { clip.startTick = nt; moved = moved || nt !== orig; forceRender(); }
+      }
+      function up() {
+        window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up);
+        if (!moved) return;                                             // pure click = select only
+        var res = overwriteLaneRegion(clip.ch, clip.startTick, clip.startTick + clip.lengthTicks, clip.id);
+        E.timeline.clips = res.kept.concat([clip]);                     // moved clip survives; others sliced
+        recycleRef.current.push({ type: "record", laneId: clip.ch, before: pre, newClipId: clip.id });
+        E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
+        bump();
+      }
+      window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+    }
+    // Ctrl/Cmd+C — copy the selected clip (deep copy incl. bufferId; buffer stays shared on paste).
+    function studioCopyClip() {
+      if (!selClip) return; var c = E.timeline.clips.find(function (x) { return x.id === selClip; });
+      var d = c && E.channels[c.ch] ? E.channels[c.ch].def : null;
+      if (!c || (d && isBackingDef(d))) return;                        // backing clips aren't copyable
+      studioClipboard.current = JSON.parse(JSON.stringify(c));
+      toast("Clip copied · Ctrl+V to paste at the red line", h(I.Note, { width: 16, height: 16 }));
+    }
+    // Ctrl/Cmd+V — paste onto the SAME lane at the red-line position (confirmed default). New id, shared
+    // buffer (non-destructive copy); overlap resolves through the recycle buffer (one Ctrl+Z restores).
+    function studioPasteClip() {
+      var src = studioClipboard.current; if (!src) return;
+      var d = E.channels[src.ch] ? E.channels[src.ch].def : null;
+      if (!d || isBackingDef(d)) { toast("That lane is locked", h(I.X, null)); return; }
+      var start = Math.max(0, recStartTick), len = src.lengthTicks, end = start + len;
+      var res = overwriteLaneRegion(src.ch, start, end, null);
+      var nc = JSON.parse(JSON.stringify(src)); nc.id = E._newClipId(); nc.startTick = start;   // shares src.bufferId (buffer reused)
+      E.timeline.clips = res.kept.concat([nc]);
+      recycleRef.current.push({ type: "record", laneId: src.ch, before: res.before, newClipId: nc.id });
+      E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
+      setSelClip(nc.id); setStudioSel(src.ch); bump();
+      toast("Clip pasted · Ctrl+Z to undo", h(I.Note, { width: 16, height: 16 }));
+    }
     // load a decoded buffer as a locked "Project" backing track (bounce OR upload). Always labeled
     // "Project"; type:'backing' (trackType), locked/read-only. Backing tracks stack (append) — never
     // a lane-0 race — and render sorted-first in the Studio views.
     function loadBacking(source, buf, blob) {
       var r = E.addMelodyFile("Project", buf, blob);
       if (r && r.def) {
+        r.def.workspace = "studio";   // backing is Studio-owned (addMelodyFile defaults its lane to producer)
         r.def.backing = true; r.def.locked = true; r.def.trackType = "backing";
         r.def.meta = { created: 0, source: source, readOnly: true };
         ensureStudioModel(r.def);
-        setStudioSel(r.def.id); setFollowArmed(false);   // a backing selection is a manual, read-only focus
+        setStudioSel(r.def.id);        // a backing selection is a manual, read-only focus
       }
       setView("timeline"); setFocus(E.focus); bump();
       toast("Project track loaded", h(I.Wave, { width: 16, height: 16 }));
@@ -899,23 +1157,142 @@
     function pickFiles(accept, multiple, cb) { var inp = document.createElement("input"); inp.type = "file"; inp.accept = accept; if (multiple) inp.multiple = true; inp.onchange = function () { if (inp.files && inp.files.length) cb(inp.files); }; inp.click(); }
     function studioAddMelody() { pickFiles("audio/*,video/*", true, function (files) { Array.prototype.forEach.call(files, function (f) { E.decodeAudioFile(f, function (buf) { E.addMelodyFile(f.name, buf, f); setView("timeline"); setFocus(E.focus); bump(); toast("Added melody: " + f.name, h(I.Wave, { width: 16, height: 16 })); }, function () { toast("Could not decode " + f.name, h(I.X, null)); }); }); }); }
     function studioMelodyMaker() { pickFiles("audio/*", false, function (files) { var f = files[0]; E.decodeAudioFile(f, function (buf) { var d = E.addPolySamplerTrack(f.name, buf, f); setView("timeline"); setFocus(E.focus); E.setFocus(E.focus); lastTonal.current = d.id; bump(); toast("Melody Maker: " + d.label, h(I.Note, { width: 16, height: 16 })); }, function () { toast("Could not decode " + f.name, h(I.X, null)); }); }); }
-    function addAudioLaneTrack() { var d = E.addAudioTrack(); setStudioSel(d.id); setStudioArm(d.id); setFocus(E.focus); E.setFocus(E.focus); bump(); toast("Added " + d.label + " — armed", h(I.Plus, { width: 16, height: 16 })); }
-    function recordStub() { toast("Capture coming in Sprint B — arm + transport wiring is live now", h(I.Mic, { width: 16, height: 16 })); }
+    // Add a Studio audio lane (workspace:'studio' — never mirrors into the Producer grid). The new lane
+    // becomes the selected track, which is also the record target (dropdown = single authority).
+    function addAudioLaneTrack() { var d = E.addAudioTrack(undefined, "studio"); setStudioSel(d.id); setFocus(E.focus); E.setFocus(E.focus); bump(); toast("Added " + d.label + " — selected as record target", h(I.Plus, { width: 16, height: 16 })); }
+    // ---- Sprint B: live microphone capture flow (replaces the stub) ------------
+    // Single cancellable state machine: idle -> (permission) -> countin -> recording -> place clip.
+    // ONE transport: the count-in starts mode-scoped playback one bar early; capture engages sample-
+    // accurately on the next downbeat via the engine worklet gate. RECORD press routes here.
+    var TPB = E.TICKS_PER_BAR;
+    function toggleRecord() {
+      if (recPhase === "recording") { finishCapture(); return; }
+      if (recPhase === "countin") { cancelCapture("Recording cancelled"); return; }   // 2nd press aborts count-in
+      startCaptureFlow();
+    }
+    function startCaptureFlow() {
+      var flow = recFlowRef.current;
+      if (flow.busy) return;                                   // no double-arm on rapid presses
+      var d = studioSel && E.channels[studioSel] ? E.channels[studioSel].def : null;
+      if (!d) { setRecErr("Select a track to enable recording"); return; }
+      if (isBackingDef(d)) { setRecErr("Backing track is read-only"); return; }
+      flow.busy = true; flow.cancelled = false; flow.timers = []; flow.oscs = []; flow.laneId = studioSel;
+      setRecErr(null);
+      // PERMISSION-FIRST (rule 4): verify the mic BEFORE the count-in starts.
+      E.armMicCapture({
+        onReady: function (latency) {
+          if (flow.cancelled) { flow.busy = false; return; }
+          // capture point = the RED record-start line (decision 3). Capture engages exactly AT the line
+          // and the write head sweeps from there.
+          var start = Math.max(0, recStartTick);
+          flow.captureTick = start; flow.latency = latency;
+          var beatSec = 60 / E.getBPM();                       // 60000/BPM ms per beat
+          studioStop(); if (E.isPlaying) E.pause();
+          // COUNT-IN (Fix 3) — ALWAYS a full 4-beat, tempo-synced count-in. The prior pass tied the beat
+          // count to the lead-in DISTANCE, so a red line at the default 0 gave 0 beats + immediate engage
+          // (count-in destroyed). Now: if there's a full bar before the line, the backing rolls now as a
+          // one-bar lead-in and capture engages when the playhead reaches the line (4 beats later). If the
+          // line sits inside bar 1 (incl. the default 0), the count-in is clicks-only and the backing +
+          // capture start TOGETHER on the downbeat. Either way it's 4 clicks + a 1-2-3-4 flash.
+          var t0, engageTime, rollAtEngage;
+          if (start >= TPB) {
+            E.start("timeline"); E.seek(start - TPB);          // roll from one bar before; start() resets, seek re-anchors _phPoint
+            t0 = (E._phPoint && E._phPoint.time) || (E.ctx.currentTime + 0.06);
+            engageTime = t0 + 4 * beatSec;                     // playhead reaches `start` exactly here
+            rollAtEngage = false;
+          } else {
+            t0 = E.ctx.currentTime + 0.12;                     // clicks only; transport idle through the count-in
+            engageTime = t0 + 4 * beatSec;
+            rollAtEngage = true;
+          }
+          for (var i = 0; i < 4; i++) flow.oscs.push(E.metronomeClick(t0 + i * beatSec, i === 0));   // 4 tempo-synced clicks
+          // arm sample-accurate engagement; onEngage fires from the capture node the instant copying begins
+          E.beginMicCapture(engageTime, function () {
+            if (flow.cancelled) return;
+            if (rollAtEngage) { E.start("timeline"); E.seek(start); }   // backing begins WITH capture on the downbeat
+            setCountBeat(0); setRecPhase("recording");
+            var poll = function () {
+              if (recFlowRef.current.cancelled || !E.isMicCapturing()) return;
+              var st = Math.max(0, flow.captureTick - E.secToTick(flow.latency));
+              var len = Math.max(E.SNAP_TICKS, E.secToTick(E.captureElapsed()));
+              setRecPreview({ ch: flow.laneId, startTick: st, lengthTicks: len, peaks: E.capturePeaks(600) });
+              refitStudio({ growing: true, extra: st + len });          // live re-fit when the take extends the session (throttled inside)
+              recFlowRef.current.raf = requestAnimationFrame(poll);
+            };
+            recFlowRef.current.raf = requestAnimationFrame(poll);
+          }, null);
+          setRecPhase("countin"); setCountBeat(1);
+          for (var b = 1; b <= 4; b++) (function (bb) {                 // always the full 1-2-3-4 flash
+            flow.timers.push(setTimeout(function () { if (!recFlowRef.current.cancelled) setCountBeat(bb); }, (bb - 1) * beatSec * 1000));
+          })(b);
+        },
+        onError: function () {
+          flow.busy = false; setRecPhase("idle"); setCountBeat(0);
+          setRecErr("Microphone access denied — check browser settings");
+          toast("Microphone access denied — check browser settings", h(I.X, null));
+        }
+      });
+    }
+    function finishCapture() {
+      var flow = recFlowRef.current;
+      if (flow.raf) cancelAnimationFrame(flow.raf);
+      E.stopMicCapture(function (result) {
+        E.stop(); setPlaying(false); setPlayStep(-1); setPlayBar(-1);
+        setRecPhase("idle"); setRecPreview(null); setCountBeat(0); flow.busy = false;
+        if (!result || !result.buffer) { toast("Nothing captured", h(I.X, null)); return; }
+        placeTake(flow.laneId, flow.captureTick, result);
+      });
+    }
+    function cancelCapture(msg) {
+      var flow = recFlowRef.current; flow.cancelled = true; flow.busy = false;
+      flow.timers.forEach(function (t) { clearTimeout(t); }); flow.timers = [];
+      (flow.oscs || []).forEach(function (o) { try { o.stop(); } catch (e) {} }); flow.oscs = [];
+      if (flow.raf) cancelAnimationFrame(flow.raf);
+      E.cancelMicCapture();
+      if (E.isPlaying) E.stop();
+      setPlaying(false); setPlayStep(-1); setPlayBar(-1);
+      setRecPhase("idle"); setCountBeat(0); setRecPreview(null);
+      if (msg) toast(msg, h(I.X, null));
+    }
+    // place the captured buffer as a clip: latency-shifted, DESTRUCTIVELY overwriting overlapped clip
+    // data on the target lane — but the whole lane's prior state goes to the session recycle buffer so
+    // one Ctrl/Cmd+Z restores it (destructive on the timeline, recoverable in session; rule 2).
+    function placeTake(laneId, captureTick, result) {
+      var bufId = "cap_" + (++E._recSeq);
+      E.userBuffers[bufId] = result.buffer;
+      var startTick = Math.max(0, captureTick - E.secToTick(result.latencySec || 0));   // latency compensation (rule 6)
+      var lengthTicks = Math.max(E.SNAP_TICKS, E.secToTick(result.durSec));
+      var endTick = startTick + lengthTicks;
+      var before = E.timeline.clips.filter(function (c) { return c.ch === laneId; }).map(function (c) { return JSON.parse(JSON.stringify(c)); });
+      var kept = [];
+      E.timeline.clips.forEach(function (c) {
+        if (c.ch !== laneId) { kept.push(c); return; }
+        var cs = c.startTick || 0, ce = cs + (c.lengthTicks || 0);
+        if (ce <= startTick || cs >= endTick) { kept.push(c); return; }   // no overlap -> keep
+        if (cs < startTick) { var left = JSON.parse(JSON.stringify(c)); left.id = E._newClipId(); left.lengthTicks = startTick - cs; kept.push(left); }
+        if (ce > endTick) { var right = JSON.parse(JSON.stringify(c)); right.id = E._newClipId(); right.startTick = endTick; right.lengthTicks = ce - endTick; if (right.kind === "audio") right.offsetTicks = (right.offsetTicks || 0) + (endTick - cs); kept.push(right); }
+        // fully-covered clips are dropped (preserved in `before` for undo)
+      });
+      var clip = { id: E._newClipId(), kind: "audio", ch: laneId, startTick: startTick, lengthTicks: lengthTicks,
+        bufferId: bufId, offsetTicks: 0, name: "Take", peaks: E.computePeaks(result.buffer), gain: 1,
+        fadeInTicks: 0, fadeOutTicks: 0, trimmed: true,
+        meta: { source: "mic", latencyOffsetSec: result.latencySec || 0, capturedAt: Date.now() } };
+      kept.push(clip); E.timeline.clips = kept;
+      recycleRef.current.push({ type: "record", laneId: laneId, before: before, newClipId: clip.id });
+      try { var blob = E._encodeWav(result.buffer); if (E.SampleDB) E.SampleDB.put(bufId, blob); } catch (e) {}
+      E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
+      setStudioSel(laneId); setFocus(E.focus); bump();
+      var lbl = E.channels[laneId] && E.channels[laneId].def ? E.channels[laneId].def.label : "track";
+      toast("Take recorded → " + lbl + " · Ctrl+Z to undo", h(I.Mic, { width: 16, height: 16 }));
+    }
     function linkFolderFromStudio() { setStudio(false); setRailCol(false); toast("Link folders from the Producer library (sidebar)", h(I.Folder, { width: 16, height: 16 })); }
 
     // ---- Studio Restructure handlers -------------------------------------------
     // context-change audio safety: stop scoped voices synchronously BEFORE any UI state change.
     function studioStop() { try { E.scope.stopScopeVoices(); } catch (e) {} }
-    // Manual track selection (dropdown/lane/track row) — one-way precedence: disables Follow-Armed.
-    function selectStudioTrack(id, manual) { studioStop(); if (manual) setFollowArmed(false); setStudioSel(id); doFocus(id); }
-    // Arm a lane. Backing tracks can't be armed. When Follow-Armed is on, the Plugins panel snaps to it.
-    function armStudioTrack(id) {
-      studioStop();
-      var d = id ? (E.channels[id] && E.channels[id].def) : null;
-      if (d && isBackingDef(d)) { toast("Backing track is read-only", h(I.X, null)); return; }
-      setStudioArm(id);
-      if (id && followArmed) { setStudioSel(id); doFocus(id); }
-    }
+    // Track selection is the SINGLE authority: it drives both the Plugins panel focus AND the record
+    // target. A track-row / lane / dropdown click routes here (synchronous stop first, as always).
+    function selectStudioTrack(id, manual) { studioStop(); setStudioSel(id); doFocus(id); }
     // [M] mute — de-click gain ramp (never a hard cut); toggles def.uiMuted; works on all tracks.
     function toggleStudioMute(id) {
       studioStop();
@@ -935,21 +1312,21 @@
       var id = pending.id, ch = E.channels[id]; if (!ch) { setDelConfirm(null); return; }
       var label = ch.def.label;
       studioStop();                                     // 1) stop scoped voices + de-click
-      if (studioArm === id) setStudioArm(null);         // 2) disarm if armed
-      // 3) compute the next selection BEFORE removal (next editable track, else null)
-      var remaining = studioTracks(E.channelDefs).filter(function (c) { return c.id !== id; });
+      // 2) compute the next selection BEFORE removal (next editable track, else null). Because
+      // selection IS the record target, this is also the record-target fallback on delete.
+      var remaining = studioTracks(E.studioDefs()).filter(function (c) { return c.id !== id; });
       var nextEditable = remaining.filter(function (c) { return !isBackingDef(c); })[0] || remaining[0];
       var nextSel = nextEditable ? nextEditable.id : null;
       // 4) SOFT delete — capture {def, clips, buffers} to the session recycle buffer, then detach.
       var clips = E.timeline.clips.filter(function (cl) { return cl.ch === id; });
       var buffers = {}; clips.forEach(function (c) { if (c.bufferId && E.userBuffers[c.bufferId]) buffers[c.bufferId] = E.userBuffers[c.bufferId]; });
       ch.def.deletedAt = Date.now();
-      recycleRef.current.push({ def: ch.def, clips: clips.map(function (c) { return JSON.parse(JSON.stringify(c)); }), buffers: buffers });
+      recycleRef.current.push({ type: "delete", def: ch.def, clips: clips.map(function (c) { return JSON.parse(JSON.stringify(c)); }), buffers: buffers });
       E.removeChannel(id);                              // engine keeps userBuffers in memory
       E.timeline.clips = E.timeline.clips.filter(function (cl) { return cl.ch !== id; });
       if (lastTonal.current === id) lastTonal.current = null;
       // 5) single UI commit
-      setFollowArmed(false); setStudioSel(nextSel); setFocus(E.focus); E.setFocus(E.focus);
+      setStudioSel(nextSel); setFocus(E.focus); E.setFocus(E.focus);
       setDelConfirm(null); bump();
       toast(label + " deleted · Ctrl+Z to undo", h(I.Trash, { width: 16, height: 16 }));
     }
@@ -957,8 +1334,17 @@
     function studioUndo() {
       var rec = recycleRef.current.pop(); if (!rec) { toast("Nothing to undo", h(I.Reset, null)); return; }
       studioStop();
+      // record-overwrite undo: drop the new take + restore the lane's pre-recording clip state (rule 2)
+      if (rec.type === "record") {
+        E.timeline.clips = E.timeline.clips.filter(function (c) { return c.ch !== rec.laneId; }).concat(rec.before);
+        E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
+        setStudioSel(rec.laneId); setFocus(E.focus); E.setFocus(E.focus); bump();
+        toast("Recording undone — take removed, track restored", h(I.Reset, { width: 16, height: 16 }));
+        return;
+      }
       var od = rec.def;
-      var nd = E.addAudioTrack(od.label);               // fresh lane: bank rows + wired nodes + id
+      var nd = E.addAudioTrack(od.label, "studio");     // fresh lane: bank rows + wired nodes + id (Studio-owned)
+      nd.workspace = "studio";
       nd.trackType = od.trackType; nd.pluginState = od.pluginState; nd.meta = od.meta;
       nd.backing = od.backing; nd.locked = od.locked; nd.uiMuted = od.uiMuted; nd.deletedAt = null;
       if (od.color) nd.color = od.color;
@@ -1007,8 +1393,8 @@
     // project on EXPLICIT save only. Autosave (scheduleSave) stays untouched → no reload persistence.
     function serializeWithStudio() {
       var data = E.serialize(); data.studio = {};
-      E.channelDefs.forEach(function (c) {
-        if ((c.type === "audio" || c.kind === "audioLane") && c.pluginState) data.studio[c.id] = { pluginState: c.pluginState, muted: !!c.uiMuted, trackType: c.trackType };
+      E.studioDefs().forEach(function (c) {
+        if (c.pluginState) data.studio[c.id] = { pluginState: c.pluginState, muted: !!c.uiMuted, trackType: c.trackType };
       });
       return data;
     }
@@ -1018,6 +1404,7 @@
       Object.keys(data.studio).forEach(function (id) {
         var ch = E.channels[id]; if (!ch) return; var s = data.studio[id];
         ensureStudioModel(ch.def);
+        ch.def.workspace = "studio";   // any track carrying Studio state is Studio-owned (corrects legacy backing migration)
         if (s.pluginState) ch.def.pluginState = s.pluginState;
         if (s.trackType) { ch.def.trackType = s.trackType; if (s.trackType === "backing") { ch.def.backing = true; ch.def.locked = true; } }
         ch.def.uiMuted = !!s.muted;
@@ -1044,21 +1431,22 @@
     function loadSlot(nm2) { try { var raw = localStorage.getItem(SLOT_PREFIX + nm2); if (raw) { var data = JSON.parse(raw); if (E.hydrate(data)) { restoreStudioSave(data); syncFromEngine(); bump(); toast("Loaded “" + nm2 + "”", h(I.Check, { width: 16, height: 16 })); } else toast("Slot unreadable", h(I.X, null)); } else toast("Slot unreadable", h(I.X, null)); } catch (e) { toast("Load failed", h(I.X, null)); } }
     function deleteSlot(nm2) { try { localStorage.removeItem(SLOT_PREFIX + nm2); var idx = JSON.parse(localStorage.getItem(SLOT_IDX) || "[]").filter(function (n) { return n !== nm2; }); localStorage.setItem(SLOT_IDX, JSON.stringify(idx)); setSlots(idx); } catch (e) {} }
 
-    // derived state
-    var channelState = {}; E.channelDefs.forEach(function (c) { var ch = E.channels[c.id]; channelState[c.id] = { route: ch.route, vol: ch.vol, pan: ch.pan, muted: ch.muted, solo: ch.solo }; });
-    var litMap = {}; if (playing && playStep >= 0 && mode === "pattern") { E.channelDefs.forEach(function (c) { litMap[c.id] = E.banks[active].steps[c.id][playStep].on; }); }
-    var routeCount = {}; E.channelDefs.forEach(function (c) { routeCount[c.route] = (routeCount[c.route] || 0) + 1; });
+    // derived state — Producer surfaces read the Producer collection ONLY (isolation). Studio lanes
+    // never appear in the rack/mixer/route-count.
+    var producerDefs = E.producerDefs();
+    var channelState = {}; producerDefs.forEach(function (c) { var ch = E.channels[c.id]; channelState[c.id] = { route: ch.route, vol: ch.vol, pan: ch.pan, muted: ch.muted, solo: ch.solo }; });
+    var litMap = {}; if (playing && playStep >= 0 && mode === "pattern") { producerDefs.forEach(function (c) { litMap[c.id] = E.banks[active].steps[c.id][playStep].on; }); }
+    var routeCount = {}; producerDefs.forEach(function (c) { routeCount[c.route] = (routeCount[c.route] || 0) + 1; });
     var insertState = E.insertDefs.map(function (d) { var ins = E.inserts[d.id]; return { id: d.id, name: d.name, vol: ins.vol, pan: ins.panVal, mute: ins.mute, solo: ins.solo, micOn: !!ins.micOn, fx: ins.fx.map(function (s) { return { type: s.type, bypass: s.bypass }; }), routeCount: routeCount[d.id] || 0 }; });
 
     // Rec Audio master availability: any unmuted audio lane with an audio clip (backing counts).
-    var recAudioAvailable = E.channelDefs.some(function (c) { return (c.type === "audio" || c.kind === "audioLane") && !c.uiMuted && E.timeline.clips.some(function (cl) { return cl.ch === c.id && cl.kind === "audio"; }); });
+    var recAudioAvailable = E.studioDefs().some(function (c) { return !c.uiMuted && E.timeline.clips.some(function (cl) { return cl.ch === c.id && cl.kind === "audio"; }); });
 
     var focusCh = (focus && E.channels[focus]) ? E.channels[focus].def : null;
     var prCh = focusCh && focusCh.tonal ? focusCh
       : ((lastTonal.current && E.channels[lastTonal.current]) ? E.channels[lastTonal.current].def : focusCh);
 
     function setTool(t) { setToolMode(t); }
-    function toggleArm() { var nx = !E.isPerfArmed(); E.armPerf(nx); setPerfArm(nx); }
     var commands = [
       { id: "play", label: playing ? "Stop" : "Play", hint: "Space", run: togglePlay },
       { id: "undo", label: "Undo", hint: "Ctrl+Z", run: doUndo },
@@ -1068,7 +1456,6 @@
       { id: "export", label: "Export… (Mixdown / Stems)", run: function () { setShowEx(true); } },
       { id: "save", label: "Export Project (.json)", run: exportProject },
       { id: "keys", label: "Toggle Musical Typing", hint: "⌨", run: function () { var nx = !musTyping; setMusTyping(nx); musRef.current = nx; } },
-      { id: "arm", label: "Toggle Note Record Arm", hint: "R", run: toggleArm },
       { id: "midi", label: "Enable MIDI Input", run: function () { E.enableMIDI(function (ok, info) { if (ok) { setMidiOn(true); toast("MIDI ready · " + info + " input(s)", h(I.Piano, { width: 16, height: 16 })); } else toast("MIDI: " + info, h(I.X, null)); }); } },
       { id: "v-timeline", label: "Go to Timeline", run: function () { setView("timeline"); } },
       { id: "tool-arrow", label: "Arrow Tool", hint: "V", run: function () { setTool("arrow"); } },
@@ -1081,18 +1468,21 @@
     var editingClip = (editClip && E.timeline.clips.indexOf(editClip) >= 0) ? editClip : null;   // guard against deleted/undone clips
 
     // live mirror for the global key handler (Studio M/Del/R/Ctrl+Z shortcuts)
-    studioKbdRef.current = { studio: studio, sel: studioSel, arm: studioArm, mute: toggleStudioMute, del: requestDeleteStudioTrack, armfn: armStudioTrack, undo: studioUndo };
+    studioKbdRef.current = { studio: studio, sel: studioSel, mute: toggleStudioMute, del: requestDeleteStudioTrack, undo: studioUndo, copy: studioCopyClip, paste: studioPasteClip };
     E._recMode = studio;   // mode-scoped playback filter (Producer=false, Rec Audio=true)
 
     return h(React.Fragment, null,
       h("div", { className: "stage" },
         h(Transport, { playing: playing, bpm: bpm, swing: swing, master: master, active: active, pos: posStr(playStep, playBar, mode), studio: studio, onToggleStudio: toggleStudio, onPlay: togglePlay, onStop: stop, onBpm: function (v) { E.setTempo(v); setBpm(v); }, onSwing: function (v) { E.setSwing(v); setSwing(v); }, onPattern: pattern, onProducerMaster: exportProducerMaster, onRecAudioMaster: exportRecAudioMaster, exporting: exporting, exportProg: exportProg, recAvailable: recAudioAvailable }),
         studio
-          ? h(StudioMode, { channelDefs: E.channelDefs, bpm: bpm, playing: playing, playTick: playTick, rev: rev, triplet: triplet, selected: studioSel, armed: studioArm, followArmed: followArmed, bouncing: bouncing, bounceProg: bounceProg, commit: bump, onPlay: togglePlay, onStop: stop,
-              onSelect: selectStudioTrack, onArm: armStudioTrack, onAddTrack: addAudioLaneTrack, onRecord: recordStub, onToggleFollow: function () { setFollowArmed(function (v) { var nx = !v; if (nx && studioArm) { setStudioSel(studioArm); doFocus(studioArm); } return nx; }); },
+          ? h(StudioMode, { channelDefs: E.studioDefs(), bpm: bpm, playing: playing, playTick: playTick, rev: rev, triplet: triplet, selected: studioSel, bouncing: bouncing, bounceProg: bounceProg, commit: bump, onPlay: togglePlay, onStop: stop,
+              fitTicks: fitTicks, dragScrub: studioDragScrub, dragRed: studioDragRed, recStartTick: recStartTick, onSelectClip: setSelClip, selClip: selClip, onClipDown: studioClipDown,
+              monitor: monitor, onToggleMonitor: toggleMonitor,
+              recPhase: recPhase, countBeat: countBeat, recPreview: recPreview, recErr: recErr,
+              onSelect: selectStudioTrack, onAddTrack: addAudioLaneTrack, onRecord: toggleRecord, onOpenTake: openDual,
               onMute: toggleStudioMute, onDelete: requestDeleteStudioTrack, onReplace: replaceBacking, onBounce: bounceCurrent, onUpload: uploadBacking })
           : h("div", { className: "workspace" },
-          h(window.FileBrowser, { collapsed: railCol, onCollapse: function () { setRailCol(!railCol); }, channelDefs: E.channelDefs, focus: focus, onFocus: doFocus, onPreview: previewSample, onAssign: assignSample, onCreateTrack: createTrackFromSample, toast: toast, onTrackAdded: function () { setFocus(E.focus); E.setFocus(E.focus); bump(); },
+          h(window.FileBrowser, { collapsed: railCol, onCollapse: function () { setRailCol(!railCol); }, channelDefs: producerDefs, focus: focus, onFocus: doFocus, onPreview: previewSample, onAssign: assignSample, onCreateTrack: createTrackFromSample, toast: toast, onTrackAdded: function () { setFocus(E.focus); E.setFocus(E.focus); bump(); },
             onAddMelody: function (files) {
               // Fix 1: decode each melody file -> full-length Audio Lane clip on the timeline.
               var total = files.length, ok = 0;
@@ -1126,7 +1516,6 @@
               h("button", { className: "hdr-btn", title: "Redo (Ctrl+Y)", onClick: doRedo }, "↷"),
               h("button", { className: "hdr-btn" + (musTyping ? " on" : ""), title: "Musical typing — ASDF row plays the focused track (Z/X = octave)", onClick: function () { var nx = !musTyping; setMusTyping(nx); musRef.current = nx; } }, "⌨ Keys"),
               h("button", { className: "hdr-btn" + (midiOn ? " on" : ""), title: "Enable MIDI controller input", onClick: function () { if (midiOn) return; E.enableMIDI(function (ok, info) { if (ok) { setMidiOn(true); toast("MIDI ready · " + info + " input(s)", h(I.Piano, { width: 16, height: 16 })); } else { toast("MIDI: " + info, h(I.X, null)); } }); } }, "MIDI"),
-              h("button", { className: "hdr-btn" + (perfArm ? " on" : ""), title: "Arm note recording — play (keys/MIDI) while the Timeline rolls to capture notes", onClick: function () { var nx = !perfArm; setPerfArm(nx); E.armPerf(nx); } }, "● Arm"),
               h("div", { className: "auth" + (playing ? " live" : "") }, h("span", { className: "pulse" }), playing ? [h("span", { key: 1 }, "Playing "), h("b", { key: 2 }, "timeline")] : "Stopped")),
             h("div", { className: "center" },
               h("div", { className: "top-pane" },
@@ -1138,7 +1527,7 @@
                     h("button", { className: "mini-btn", onClick: function () { E.clearPattern(); bump(); toast("Pattern " + (active + 1) + " cleared", h(I.Reset, null)); } }, [h(I.Reset, { width: 13, height: 13, key: 1 }), "Clear"]),
                     h("button", { className: "mini-btn", onClick: function () { randomize(active, bump, toast); } }, [h(I.Dice, { width: 13, height: 13, key: 1 }), "Spice"])) : null),
                 view === "rack" ? h(React.Fragment, null,
-                    h(window.ChannelRack, { channels: E.channelDefs, pattern: E.banks[active], state: channelState, focus: focus, litMap: litMap, playStep: mode === "pattern" ? playStep : -1, onFocus: doFocus, onToggle: toggleStep, onVol: setVol, onPan: setPan, onRoute: setRoute, onMute: muteCh, onSolo: soloCh, onDropSample: dropSample, onDelete: deleteTrack }),
+                    h(window.ChannelRack, { channels: producerDefs, pattern: E.banks[active], state: channelState, focus: focus, litMap: litMap, playStep: mode === "pattern" ? playStep : -1, onFocus: doFocus, onToggle: toggleStep, onVol: setVol, onPan: setPan, onRoute: setRoute, onMute: muteCh, onSolo: soloCh, onDropSample: dropSample, onDelete: deleteTrack }),
                     h(AddTrackBar, { onAdd: addTrack }))
                   : view === "piano" ? (
                       editingClip
@@ -1146,7 +1535,7 @@
                         : prCh
                           ? h(window.PianoRoll, { ch: prCh, pattern: E.banks[active], steps: E.getPatternLength(active) * 16, lengthBars: E.getPatternLength(active), onSetLength: function (b) { E.setPatternLength(b, active); bump(); }, playStep: mode === "pattern" ? playStep : -1, rev: rev, onAddNote: function (c, p, s, l) { return E.addNote(c, p, s, l); }, onUpdateNote: function (id, patch) { E.updateNote(id, patch); }, onRemoveNote: function (id) { E.removeNote(id); }, onPreview: function (p) { if (prCh && prCh.tonal) E.previewNote(prCh.id, p - (prCh.base || 0), 100); }, commit: bump })
                           : h(EmptyPane, { title: "No tonal instrument", sub: "Add a melodic track (it routes here automatically)." }))
-                    : h(window.Timeline, { channels: E.channelDefs, playheadTick: playTick, tool: toolMode, onSetTool: setToolMode, triplet: triplet, onSetTriplet: setTriplet, onCommit: bump, onDeleteTrack: deleteTrack, onFocusStrip: doFocus, onScrub: function (tick) { E.seek(tick); setPlayTick(tick); }, onOpenClip: openDual, onOpenClipFx: openClipFx, onEditClip: openDual, onOpenWave: openDual, onToast: function (m) { toast(m, h(I.Mic, { width: 16, height: 16 })); } })),
+                    : h(window.Timeline, { channels: producerDefs, playheadTick: playTick, tool: toolMode, onSetTool: setToolMode, triplet: triplet, onSetTriplet: setTriplet, onCommit: bump, onDeleteTrack: deleteTrack, onFocusStrip: doFocus, onScrub: function (tick) { E.seek(tick); setPlayTick(tick); }, onOpenClip: openDual, onOpenClipFx: openClipFx, onEditClip: openDual, onOpenWave: openDual, onToast: function (m) { toast(m, h(I.Mic, { width: 16, height: 16 })); } })),
               h("div", { className: "dashboard" },
                 h(window.Mixer, { inserts: insertState, selected: selIns, master: master, focusCh: focusCh, pattern: E.banks[active], rev: rev, playStep: mode === "pattern" ? playStep : -1, onSetStep: setStep, onSelect: setSelIns, onVol: insVol, onPan: insPan, onMute: insMute, onSolo: insSolo, onMasterVol: function (v) { E.setMaster(v); setMaster(v); }, onFxClick: function (id, slot) { setFxModal({ id: id, slot: slot }); }, onCommit: bump }))))),
         (clipEdit && E.timeline.clips.indexOf(clipEdit) >= 0) ? h(ClipEditor, {
@@ -1190,7 +1579,7 @@
   }
   function randomize(active, bump, toast) {
     var b = E.banks[active];
-    E.channelDefs.forEach(function (c) { for (var i = 0; i < 16; i++) { var st = b.steps[c.id][i]; var pr = c.type === "chat" || c.type === "shaker" ? 0.55 : c.type === "kick" ? 0.3 : c.type === "arp" ? 0.5 : 0.22; st.on = Math.random() < pr; st.vel = 60 + Math.floor(Math.random() * 67); if (c.tonal && st.on) st.pitch = [0, 0, 3, 5, 7, 7, 10, 12][Math.floor(Math.random() * 8)] - (c.type === "sub" || c.type === "reese" ? 0 : 0); } });
+    E.producerDefs().forEach(function (c) { for (var i = 0; i < 16; i++) { var st = b.steps[c.id][i]; var pr = c.type === "chat" || c.type === "shaker" ? 0.55 : c.type === "kick" ? 0.3 : c.type === "arp" ? 0.5 : 0.22; st.on = Math.random() < pr; st.vel = 60 + Math.floor(Math.random() * 67); if (c.tonal && st.on) st.pitch = [0, 0, 3, 5, 7, 7, 10, 12][Math.floor(Math.random() * 8)] - (c.type === "sub" || c.type === "reese" ? 0 : 0); } });
     bump(); toast("Pattern " + (active + 1) + " spiced up", h(I.Sparkle, null));
   }
 

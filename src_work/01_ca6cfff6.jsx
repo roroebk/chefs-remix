@@ -32,6 +32,7 @@
     Folder: function (p) { return svg(p, P("M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z")); },
     Mic: function (p) { return svg(p, [h("rect", { key: 1, x: 9, y: 3, width: 6, height: 11, rx: 3 }), P("M5 11a7 7 0 0014 0M12 18v3")]); },
     Monitor: function (p) { return svg(p, [h("rect", { key: 1, x: 3, y: 4, width: 18, height: 12, rx: 2 }), P("M8 20h8M12 16v4")]); },
+    Headphones: function (p) { return svg(p, [P("M4 14v-2a8 8 0 0116 0v2"), h("rect", { key: 1, x: 3, y: 13, width: 4, height: 7, rx: 1.6 }), h("rect", { key: 2, x: 17, y: 13, width: 4, height: 7, rx: 1.6 })]); },
     Slider: function (p) { return svg(p, [P("M4 8h10M18 8h2M4 16h2M10 16h10"), h("circle", { key: 1, cx: 16, cy: 8, r: 2.2, fill: "currentColor" }), h("circle", { key: 2, cx: 8, cy: 16, r: 2.2, fill: "currentColor" })]); },
     Dice: function (p) { return svg(p, [h("rect", { key: 1, x: 4, y: 4, width: 16, height: 16, rx: 3 }), h("circle", { key: 2, cx: 9, cy: 9, r: 1.2, fill: "currentColor" }), h("circle", { key: 3, cx: 15, cy: 15, r: 1.2, fill: "currentColor" }), h("circle", { key: 4, cx: 15, cy: 9, r: 1.2, fill: "currentColor" }), h("circle", { key: 5, cx: 9, cy: 15, r: 1.2, fill: "currentColor" })]); },
     Trash: function (p) { return svg(p, [P("M4 7h16M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2M6 7l1 13h10l1-13")]); }
