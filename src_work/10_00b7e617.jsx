@@ -731,6 +731,10 @@
           // tap -> master; default OFF; ON warns about speaker feedback. Behavior unchanged from before.
           h("button", { className: "rz-mon" + (props.monitor ? " on" : ""), onClick: props.onToggleMonitor, "aria-label": "Toggle input monitoring",
             title: props.monitor ? "Input monitoring ON — you hear your mic input (use headphones)" : "Monitor input — hear your mic in real time. Use headphones; monitoring through speakers will feed back." }, h(I.Headphones, { width: 13, height: 13 })),
+          // Fix 5 — Rec-Audio undo/redo arrows (bounded session stack; deletes/overwrites/range ops/moves).
+          // Disabled when their stack is empty. Distinct from the Producer header's engine-snapshot ↶/↷.
+          h("button", { className: "rz-hist", onClick: props.onUndo, disabled: !props.canUndo, title: "Undo (Ctrl/Cmd+Z)", "aria-label": "Undo" }, "↶"),
+          h("button", { className: "rz-hist", onClick: props.onRedo, disabled: !props.canRedo, title: "Redo (Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y)", "aria-label": "Redo" }, "↷"),
           h("div", { className: "rz-vu" }, h(W.MeterBar, { master: true, idx: 0 }), h(W.MeterBar, { master: true, idx: 1 })),
           // Fix A — recording-latency calibration (ms). Trims residual take alignment by ear per device;
           // additive to the measured capture latency at placement. Positive = shift takes earlier.
@@ -747,7 +751,7 @@
         h(AudioLaneMatrix, { tracks: tracks, selected: props.selected, playing: props.playing, playTick: props.playTick, rev: props.rev, fitTicks: props.fitTicks, recPhase: props.recPhase, recPreview: props.recPreview, recStartTick: props.recStartTick, selClip: props.selClip, rangeSel: props.rangeSel, onRangeDown: props.onRangeDown, dragScrub: props.dragScrub, dragRed: props.dragRed, onClipDown: props.onClipDown, onSelectClip: props.onSelectClip, onSelect: props.onSelect, onAddTrack: props.onAddTrack, onOpenTake: props.onOpenTake }),
         h(StudioRuler, { fitTicks: props.fitTicks, playTick: props.playTick, recording: props.recPhase === "recording", recPos: (props.recPreview ? (props.recPreview.startTick + props.recPreview.lengthTicks) : -1), dragScrub: props.dragScrub }),
         h("div", { className: "studio-bottombar" },
-        h(RecordBar, { selected: props.selected, onRecord: props.onRecord, playing: props.playing, onPlay: props.onPlay, onStop: props.onStop, recPhase: props.recPhase, countBeat: props.countBeat, recErr: props.recErr, rev: props.rev, playTick: props.playTick, recStartTick: props.recStartTick, monitor: props.monitor, onToggleMonitor: props.onToggleMonitor, calibMs: props.calibMs, onSetCalib: props.onSetCalib }),
+        h(RecordBar, { selected: props.selected, onRecord: props.onRecord, playing: props.playing, onPlay: props.onPlay, onStop: props.onStop, recPhase: props.recPhase, countBeat: props.countBeat, recErr: props.recErr, rev: props.rev, playTick: props.playTick, recStartTick: props.recStartTick, monitor: props.monitor, onToggleMonitor: props.onToggleMonitor, calibMs: props.calibMs, onSetCalib: props.onSetCalib, onUndo: props.onUndo, onRedo: props.onRedo, canUndo: props.canUndo, canRedo: props.canRedo }),
         window.StudioPlugins
           ? h(window.StudioPlugins, { tracks: tracks, selected: props.selected, bpm: props.bpm, rev: props.rev, triplet: props.triplet, bouncing: props.bouncing, onSelect: props.onSelect, onMute: props.onMute, onDelete: props.onDelete, onReplace: props.onReplace, commit: props.commit })
           : null)));
@@ -814,7 +818,10 @@
     var rpvS = useState(null); var recPreview = rpvS[0], setRecPreview = rpvS[1];     // live growing take {ch,startTick,lengthTicks,peaks}
     var reS = useState(null); var recErr = reS[0], setRecErr = reS[1];                // transient capture error readout
     var recFlowRef = useRef({ raf: 0, timers: [], captureTick: 0, engageTime: 0, cancelled: false });
-    var recycleRef = useRef([]);                                                       // session recycle buffer for soft-deleted tracks
+    var recycleRef = useRef([]);                                                       // Fix 5: UNDO stack (session) — track deletes, record overwrites, range ops, clip moves
+    var redoRef = useRef([]);                                                          // Fix 5: REDO stack (cleared by any new op; refilled by undo)
+    var UNDO_CAP = 50;                                                                 // bounded, memory-safe (drops the oldest past the cap)
+    var hsS = useState(0); function refreshHist() { hsS[1](function (x) { return x + 1; }); }   // re-render so the undo/redo buttons enable/disable
     var monS = useState(false); var monitor = monS[0], setMonitor = monS[1];           // input-monitoring toggle (session state, always OFF on load — decision 2)
     var rcaS = useState(0); var recCalib = rcaS[0], setRecCalibState = rcaS[1];         // Fix A: recording-latency calibration mirror (ms; authority is engine._recCalibMs)
     // studio auto-fit: one shared time->width scale (session max ticks, with headroom). fitTicksRef
@@ -844,6 +851,7 @@
         // over the Producer hotkeys while Rec Audio is active; input-focus already guarded above.
         var sk = studioKbdRef.current;
         if (sk && sk.studio) {
+          if (ctrlK && (e.code === "KeyY" || (e.code === "KeyZ" && e.shiftKey))) { e.preventDefault(); sk.redo && sk.redo(); return; }   // Fix 5: Studio redo
           if (ctrlK && e.code === "KeyZ" && !e.shiftKey) { e.preventDefault(); sk.undo(); return; }
           if (ctrlK && e.code === "KeyC") { e.preventDefault(); sk.copy(); return; }        // range OR clip copy (Fix B / decision 4)
           if (ctrlK && e.code === "KeyV") { e.preventDefault(); sk.paste(); return; }        // range OR clip paste at the red line
@@ -1093,7 +1101,7 @@
         if (!moved) return;                                             // pure click = select only
         var res = overwriteLaneRegion(clip.ch, clip.startTick, clip.startTick + clip.lengthTicks, clip.id);
         E.timeline.clips = res.kept.concat([clip]);                     // moved clip survives; others sliced
-        recycleRef.current.push({ type: "record", laneId: clip.ch, before: pre, newClipId: clip.id });
+        pushUndo({ type: "record", laneId: clip.ch, before: pre, newClipId: clip.id });
         E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
         bump();
       }
@@ -1117,7 +1125,7 @@
       var res = overwriteLaneRegion(src.ch, start, end, null);
       var nc = JSON.parse(JSON.stringify(src)); nc.id = E._newClipId(); nc.startTick = start;   // shares src.bufferId (buffer reused)
       E.timeline.clips = res.kept.concat([nc]);
-      recycleRef.current.push({ type: "record", laneId: src.ch, before: res.before, newClipId: nc.id });
+      pushUndo({ type: "record", laneId: src.ch, before: res.before, newClipId: nc.id });
       E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
       setSelClip(nc.id); setStudioSel(src.ch); bump();
       toast("Clip pasted · Ctrl+Z to undo", h(I.Note, { width: 16, height: 16 }));
@@ -1160,7 +1168,7 @@
       if (!d || isBackingDef(d)) { setRangeSel(null); return; }
       var res = overwriteLaneRegion(rng.ch, rng.startTick, rng.endTick, null);
       E.timeline.clips = res.kept;                                     // gap left where the range was
-      recycleRef.current.push({ type: "record", laneId: rng.ch, before: res.before, newClipId: null });
+      pushUndo({ type: "record", laneId: rng.ch, before: res.before, newClipId: null });
       E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
       setRangeSel(null); setSelClip(null); bump();
       toast("Range deleted · Ctrl+Z to undo", h(I.X, { width: 16, height: 16 }));
@@ -1199,7 +1207,7 @@
         var nc = JSON.parse(JSON.stringify(seg)); nc.id = E._newClipId(); nc.startTick = base + (seg.startOffset || 0); delete nc.startOffset; return nc;
       });
       E.timeline.clips = res.kept.concat(added);
-      recycleRef.current.push({ type: "record", laneId: rc.ch, before: res.before, newClipId: null });
+      pushUndo({ type: "record", laneId: rc.ch, before: res.before, newClipId: null });
       E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
       setStudioSel(rc.ch); setRangeSel(null); bump();
       toast("Range pasted · Ctrl+Z to undo", h(I.Note, { width: 16, height: 16 }));
@@ -1318,10 +1326,20 @@
           E.beginMicCapture(engageTime, function () {
             if (flow.cancelled) return;
             if (rollAtEngage) { E.start("timeline"); E.seek(start); }   // backing begins WITH capture on the downbeat
+            // Fix 4 (punch-in auto-mute): tag the record-target lane so the scheduler schedule-excludes its
+            // PRIOR clips while capture is ACTIVE (playback-side only; user mute flags untouched; cleared on
+            // finish/cancel). Backing + other lanes keep playing.
+            E._capLaneId = flow.laneId;
+            // Fix 1 (alignment ESCALATION): capture the ACTUAL engage tick from the first-captured-sample
+            // clock time (_cap.startedAt) rather than assuming capture engaged exactly at the requested
+            // downbeat. Sampled here, at engage, while the playhead anchor (_phPoint) is fresh.
+            flow.engageStartedAt = E.captureStartedAt();
+            flow.engageTick = E.tickAtTime(flow.engageStartedAt);
             setCountBeat(0); setRecPhase("recording");
             var poll = function () {
               if (recFlowRef.current.cancelled || !E.isMicCapturing()) return;
-              var st = Math.max(0, flow.captureTick - E.secToTick(flow.latency + E.recCalibSec()));   // Fix A: match placeTake (capture latency + calibration)
+              var baseTick = (flow.engageTick != null ? flow.engageTick : flow.captureTick);
+              var st = Math.max(0, baseTick - E.secToTick(flow.latency + E.recCalibSec()));   // Fix 1: match placeTake (engage tick − capture latency − calibration)
               var len = Math.max(E.SNAP_TICKS, E.secToTick(E.captureElapsed()));
               setRecPreview({ ch: flow.laneId, startTick: st, lengthTicks: len, peaks: E.capturePeaks(600) });
               refitStudio({ growing: true, extra: st + len });          // live re-fit when the take extends the session (throttled inside)
@@ -1345,6 +1363,7 @@
       var flow = recFlowRef.current;
       if (flow.raf) cancelAnimationFrame(flow.raf);
       E.stopMicCapture(function (result) {
+        E._capLaneId = null;                                    // Fix 4: capture ended → target lane returns to normal scheduling
         E.stop(); setPlaying(false); setPlayStep(-1); setPlayBar(-1);
         setRecPhase("idle"); setRecPreview(null); setCountBeat(0); flow.busy = false;
         if (!result || !result.buffer) { toast("Nothing captured", h(I.X, null)); return; }
@@ -1353,6 +1372,7 @@
     }
     function cancelCapture(msg) {
       var flow = recFlowRef.current; flow.cancelled = true; flow.busy = false;
+      E._capLaneId = null;                                       // Fix 4: aborted capture → clear the schedule-exclusion
       flow.timers.forEach(function (t) { clearTimeout(t); }); flow.timers = [];
       (flow.oscs || []).forEach(function (o) { try { o.stop(); } catch (e) {} }); flow.oscs = [];
       if (flow.raf) cancelAnimationFrame(flow.raf);
@@ -1366,10 +1386,29 @@
     // data on the target lane — but the whole lane's prior state goes to the session recycle buffer so
     // one Ctrl/Cmd+Z restores it (destructive on the timeline, recoverable in session; rule 2).
     function placeTake(laneId, captureTick, result) {
+      var flow = recFlowRef.current;
       var bufId = "cap_" + (++E._recSeq);
       E.userBuffers[bufId] = result.buffer;
-      var comp = (result.latencySec || 0) + E.recCalibSec();                            // Fix A: capture-side latency + session calibration
-      var startTick = Math.max(0, captureTick - E.secToTick(comp));                     // latency compensation (rule 6)
+      var comp = (result.latencySec || 0) + E.recCalibSec();                            // capture-side latency + session calibration
+      // Fix 1 (alignment ESCALATION): anchor placement on the ACTUAL engage tick (derived from the first
+      // captured sample's clock time) instead of the ASSUMED downbeat `captureTick`. The prior pass placed
+      // at `captureTick − comp`, silently assuming capture engaged exactly at the requested tick — any
+      // engage-gap (worklet quantum + arm latency) then mis-placed the take even after the baseLatency/calib
+      // fix. `engageTick` removes that gap; `comp` still trims the input-path delay + per-device calibration.
+      var engageTick = (flow && flow.engageTick != null) ? flow.engageTick : captureTick;
+      var startTick = Math.max(0, Math.round(engageTick - E.secToTick(comp)));          // latency compensation (rule 6)
+      // INSTRUMENTATION (Fix 1 Phase-0): one compact trace per take so the residual delay can be MEASURED
+      // on-device, not guessed (the manual test uses these numbers to dial CAL by ear).
+      try {
+        var spt = E.secPerTick();
+        console.log("[CR rec-align]", {
+          bpm: E.getBPM(), requestedTick: Math.round(captureTick), engageStartedAt: result.startedAt || 0,
+          engageTick: Math.round(engageTick), engageGapMs: Math.round((engageTick - captureTick) * spt * 1000),
+          measuredLatencyMs: Math.round((result.latencySec || 0) * 1000), calibMs: E.getRecCalib(),
+          appliedCompMs: Math.round(comp * 1000), placedTick: startTick,
+          placedVsRequestedMs: Math.round((startTick - captureTick) * spt * 1000)
+        });
+      } catch (e) {}
       var lengthTicks = Math.max(E.SNAP_TICKS, E.secToTick(result.durSec));
       var endTick = startTick + lengthTicks;
       var before = E.timeline.clips.filter(function (c) { return c.ch === laneId; }).map(function (c) { return JSON.parse(JSON.stringify(c)); });
@@ -1385,9 +1424,9 @@
       var clip = { id: E._newClipId(), kind: "audio", ch: laneId, startTick: startTick, lengthTicks: lengthTicks,
         bufferId: bufId, offsetTicks: 0, name: "Take", peaks: E.computePeaks(result.buffer), gain: 1,
         fadeInTicks: 0, fadeOutTicks: 0, trimmed: true,
-        meta: { source: "mic", latencyOffsetSec: comp, measuredLatencySec: result.latencySec || 0, calibMs: E.getRecCalib(), capturedAt: Date.now() } };
+        meta: { source: "mic", latencyOffsetSec: comp, measuredLatencySec: result.latencySec || 0, calibMs: E.getRecCalib(), requestedTick: Math.round(captureTick), engageTick: Math.round(engageTick), engageStartedAt: result.startedAt || 0, capturedAt: Date.now() } };
       kept.push(clip); E.timeline.clips = kept;
-      recycleRef.current.push({ type: "record", laneId: laneId, before: before, newClipId: clip.id });
+      pushUndo({ type: "record", laneId: laneId, before: before, newClipId: clip.id });
       try { var blob = E._encodeWav(result.buffer); if (E.SampleDB) E.SampleDB.put(bufId, blob); } catch (e) {}
       E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
       setStudioSel(laneId); setFocus(E.focus); bump();
@@ -1427,43 +1466,82 @@
       var nextEditable = remaining.filter(function (c) { return !isBackingDef(c); })[0] || remaining[0];
       var nextSel = nextEditable ? nextEditable.id : null;
       // 4) SOFT delete — capture {def, clips, buffers} to the session recycle buffer, then detach.
-      var clips = E.timeline.clips.filter(function (cl) { return cl.ch === id; });
-      var buffers = {}; clips.forEach(function (c) { if (c.bufferId && E.userBuffers[c.bufferId]) buffers[c.bufferId] = E.userBuffers[c.bufferId]; });
-      ch.def.deletedAt = Date.now();
-      recycleRef.current.push({ type: "delete", def: ch.def, clips: clips.map(function (c) { return JSON.parse(JSON.stringify(c)); }), buffers: buffers });
-      E.removeChannel(id);                              // engine keeps userBuffers in memory
-      E.timeline.clips = E.timeline.clips.filter(function (cl) { return cl.ch !== id; });
-      if (lastTonal.current === id) lastTonal.current = null;
+      pushUndo(_historyRemoveTrack(id));                // 4) soft delete — captures {def,clips,buffers} to the undo stack
       // 5) single UI commit
       setStudioSel(nextSel); setFocus(E.focus); E.setFocus(E.focus);
       setDelConfirm(null); bump();
       toast(label + " deleted · Ctrl+Z to undo", h(I.Trash, { width: 16, height: 16 }));
     }
-    // Undo the last soft-delete — reattach the track (new lane), restore its buffers + clips + model.
-    function studioUndo() {
-      var rec = recycleRef.current.pop(); if (!rec) { toast("Nothing to undo", h(I.Reset, null)); return; }
-      studioStop();
-      // record-overwrite undo: drop the new take + restore the lane's pre-recording clip state (rule 2)
-      if (rec.type === "record") {
-        E.timeline.clips = E.timeline.clips.filter(function (c) { return c.ch !== rec.laneId; }).concat(rec.before);
-        E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
-        setStudioSel(rec.laneId); setFocus(E.focus); E.setFocus(E.focus); bump();
-        toast("Recording undone — take removed, track restored", h(I.Reset, { width: 16, height: 16 }));
-        return;
-      }
-      var od = rec.def;
+    // ================= Fix 5: bounded undo/redo STACK (session) =========================================
+    // recycleRef = undo stack, redoRef = redo stack (both cap UNDO_CAP). Every state-changing op pushes a
+    // reversal entry via pushUndo (which clears the redo branch — standard semantics). Undo/redo are
+    // SYMMETRIC: applying an entry mutates state AND returns the inverse entry for the opposite stack.
+    // Entry shapes: {type:"record", laneId, before} (restore a lane's clip list) and the track-delete pair
+    // {type:"delete", def, clips, buffers} (restore a soft-deleted track) <-> {type:"redelete", chId}.
+    function pushUndo(entry) {
+      if (!entry) return;
+      recycleRef.current.push(entry);
+      if (recycleRef.current.length > UNDO_CAP) recycleRef.current.shift();   // bounded (drop oldest)
+      redoRef.current = [];                                                   // a new op clears the redo branch
+      refreshHist();
+    }
+    function _laneSnapshot(laneId) { return E.timeline.clips.filter(function (c) { return c.ch === laneId; }).map(function (c) { return JSON.parse(JSON.stringify(c)); }); }
+    // remove a track (soft) and RETURN the {type:"delete"} restore entry describing how to bring it back.
+    function _historyRemoveTrack(id) {
+      var ch = E.channels[id]; if (!ch) return null;
+      var clips = E.timeline.clips.filter(function (cl) { return cl.ch === id; });
+      var buffers = {}; clips.forEach(function (c) { if (c.bufferId && E.userBuffers[c.bufferId]) buffers[c.bufferId] = E.userBuffers[c.bufferId]; });
+      var entry = { type: "delete", def: ch.def, clips: clips.map(function (c) { return JSON.parse(JSON.stringify(c)); }), buffers: buffers };
+      ch.def.deletedAt = Date.now();
+      E.removeChannel(id);                              // engine keeps userBuffers in memory
+      E.timeline.clips = E.timeline.clips.filter(function (cl) { return cl.ch !== id; });
+      if (lastTonal.current === id) lastTonal.current = null;
+      return entry;
+    }
+    // restore a soft-deleted track from a {type:"delete"} entry; RETURN the {type:"redelete"} inverse.
+    function _historyRestoreTrack(entry) {
+      var od = entry.def;
       var nd = E.addAudioTrack(od.label, "studio");     // fresh lane: bank rows + wired nodes + id (Studio-owned)
       nd.workspace = "studio";
       nd.trackType = od.trackType; nd.pluginState = od.pluginState; nd.meta = od.meta;
       nd.backing = od.backing; nd.locked = od.locked; nd.uiMuted = od.uiMuted; nd.deletedAt = null;
       if (od.color) nd.color = od.color;
-      rec.clips.forEach(function (c) {
-        if (c.bufferId && rec.buffers[c.bufferId]) E.userBuffers[c.bufferId] = rec.buffers[c.bufferId];
+      entry.clips.forEach(function (c) {
+        if (c.bufferId && entry.buffers[c.bufferId]) E.userBuffers[c.bufferId] = entry.buffers[c.bufferId];
         var nc = JSON.parse(JSON.stringify(c)); nc.ch = nd.id; E.timeline.clips.push(nc);
       });
+      return { type: "redelete", chId: nd.id };
+    }
+    // apply an entry's reversal, RETURN the inverse entry (for the opposite stack). Pure w.r.t. UI.
+    function reverseEntry(rec) {
+      if (!rec) return null;
+      if (rec.type === "record") {                      // restore a lane's clips; inverse captures the current (post) state
+        var cur = _laneSnapshot(rec.laneId);
+        E.timeline.clips = E.timeline.clips.filter(function (c) { return c.ch !== rec.laneId; }).concat(rec.before);
+        return { type: "record", laneId: rec.laneId, before: cur };
+      }
+      if (rec.type === "delete") { return _historyRestoreTrack(rec); }     // restore track; inverse re-deletes it
+      if (rec.type === "redelete") { return _historyRemoveTrack(rec.chId); } // delete again; inverse restores it
+      return null;
+    }
+    function _historyCommit(sel, msg) {
       E.recomputeTimelineLength(); if (E._refreshTimelineEvents) E._refreshTimelineEvents();
-      setStudioSel(nd.id); setFocus(E.focus); E.setFocus(E.focus); bump();
-      toast("Restored " + nd.label, h(I.Reset, { width: 16, height: 16 }));
+      if (sel != null) setStudioSel(sel);
+      setFocus(E.focus); E.setFocus(E.focus); refreshHist(); bump();
+      if (msg) toast(msg, h(I.Reset, { width: 16, height: 16 }));
+    }
+    function studioUndo() {
+      var rec = recycleRef.current.pop(); if (!rec) { toast("Nothing to undo", h(I.Reset, null)); return; }
+      studioStop();
+      var inv = reverseEntry(rec); if (inv) redoRef.current.push(inv);       // undo does NOT clear redo
+      _historyCommit(rec.laneId != null ? rec.laneId : (inv && inv.chId), "Undo");
+    }
+    function studioRedo() {
+      var rec = redoRef.current.pop(); if (!rec) { toast("Nothing to redo", h(I.Reset, null)); return; }
+      studioStop();
+      var inv = reverseEntry(rec);                                           // re-apply; push inverse back to undo (no redo-clear)
+      if (inv) { recycleRef.current.push(inv); if (recycleRef.current.length > UNDO_CAP) recycleRef.current.shift(); }
+      _historyCommit(rec.laneId != null ? rec.laneId : (inv && inv.chId), "Redo");
     }
     // ---- project controls (Phase 1: New / Slots / Export-Import) ----
     var SLOT_IDX = "chefs_project_slots", SLOT_PREFIX = "chefs_slot:";
@@ -1577,7 +1655,7 @@
     var editingClip = (editClip && E.timeline.clips.indexOf(editClip) >= 0) ? editClip : null;   // guard against deleted/undone clips
 
     // live mirror for the global key handler (Studio M/Del/R/Ctrl+Z shortcuts)
-    studioKbdRef.current = { studio: studio, sel: studioSel, range: !!rangeSel, mute: toggleStudioMute, del: requestDeleteStudioTrack, delRange: deleteRange, clearRange: function () { setRangeSel(null); }, undo: studioUndo, copy: studioCopy, paste: studioPaste };
+    studioKbdRef.current = { studio: studio, sel: studioSel, range: !!rangeSel, mute: toggleStudioMute, del: requestDeleteStudioTrack, delRange: deleteRange, clearRange: function () { setRangeSel(null); }, undo: studioUndo, redo: studioRedo, copy: studioCopy, paste: studioPaste };
     E._recMode = studio;   // mode-scoped playback filter (Producer=false, Rec Audio=true)
 
     return h(React.Fragment, null,
@@ -1590,6 +1668,7 @@
               monitor: monitor, onToggleMonitor: toggleMonitor, calibMs: recCalib, onSetCalib: setRecCalibration,
               recPhase: recPhase, countBeat: countBeat, recPreview: recPreview, recErr: recErr,
               onSelect: selectStudioTrack, onAddTrack: addAudioLaneTrack, onRecord: toggleRecord, onOpenTake: openDual,
+              onUndo: studioUndo, onRedo: studioRedo, canUndo: recycleRef.current.length > 0, canRedo: redoRef.current.length > 0,
               onMute: toggleStudioMute, onDelete: requestDeleteStudioTrack, onReplace: replaceBacking, onBounce: bounceCurrent, onUpload: uploadBacking })
           : h("div", { className: "workspace" },
           h(window.FileBrowser, { collapsed: railCol, onCollapse: function () { setRailCol(!railCol); }, channelDefs: producerDefs, focus: focus, onFocus: doFocus, onPreview: previewSample, onAssign: assignSample, onCreateTrack: createTrackFromSample, toast: toast, onTrackAdded: function () { setFocus(E.focus); E.setFocus(E.focus); bump(); },

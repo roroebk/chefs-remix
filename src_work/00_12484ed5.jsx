@@ -115,6 +115,7 @@
     this.userBuffers = {}; this._bufSeq = 0; this._micRec = null;          // decoded sampler buffers (import / mic)
     this._recState = null; this._recSeq = 0;                                // continuous timeline audio recording (MediaRecorder path)
     this._micStream = null; this._cap = null;                               // Sprint B: cached mic stream + live PCM capture state
+    this._capLaneId = null;                                                 // Fix 4: record-target lane id (set by the App at capture engage) — its prior clips are schedule-excluded while capture is ACTIVE
     this._monitorOn = false;                                                // Rec-Audio enhancement: input-monitoring toggle (session state, defaults OFF)
     this._recCalibMs = 0;                                                   // Fix A: per-session recording-latency calibration (ms, default 0, additive)
     this._perfArmed = false; this._perfClips = {}; this._openNotes = {}; this._midiOn = false;  // MIDI/keyboard performance
@@ -299,9 +300,17 @@
     // the top. Uses the `wet` param (0..0.8) as primary, `size` for the tail length. Dry when absent.
     if (reverb) {
       var sz = reverb.params.size != null ? reverb.params.size : 0.6;
-      if (Math.abs(sz - ins.rvSize) > 0.001 || !ins.conv.buffer) { ins.conv.buffer = this._makeImpulse(0.4 + sz * 3.6, 1.6 + sz * 2.6); ins.rvSize = sz; }
+      // Fix 6 (ESCALATION — Producer reverb still weak): PORT the Studio convolver's implementation to the
+      // Producer insert reverb so the SAME setting is comparably dramatic in both tabs. Two changes vs the
+      // prior pass: (1) SECONDS-scaled tail with the gentler 2.6 decay used by studioFx(_makeImpulse(2.4,2.6))
+      // — the old 1.6+sz*2.6 decay fell off too steeply, giving a thin, short tail that read as "no reverb";
+      // (2) a higher wet ceiling so a given wet knob is unmistakably wet. The fader(0.8) the send sums into
+      // is COMMON-MODE (it scales dry AND wet equally) so it never changed the wet:dry balance — the weakness
+      // was the impulse + ceiling, not the fader. sz 0..1 -> 0.6s..5.0s (default 0.6 -> ~3.24s, ~Studio range).
+      var revSecs = 0.6 + sz * 4.4;
+      if (Math.abs(sz - ins.rvSize) > 0.001 || !ins.conv.buffer) { ins.conv.buffer = this._makeImpulse(revSecs, 2.6); ins.rvSize = sz; }
       var rw = reverb.params.wet != null ? reverb.params.wet : (reverb.params.mix != null ? reverb.params.mix * 0.8 : 0.24);
-      ins.rvWet.gain.value = Math.pow(rw / 0.8, 0.55) * 1.7;    // wet=0.8 -> ~1.7 (drenched); low wet still clearly audible
+      ins.rvWet.gain.value = rw > 0 ? Math.pow(rw / 0.8, 0.5) * 2.4 : 0;   // wet=0.8 -> 2.4 send (drenched); wet=0 stays EXACTLY dry (zero-state preserved)
     } else { ins.rvWet.gain.value = 0; }
     // Pitch Fix (Auto-Tune)
     var pf = null; ins.fx.forEach(function (s) { if (s.type === "pitchfix" && !s.bypass) pf = s; });
@@ -974,6 +983,18 @@
   Engine.prototype.setRecCalib = function (ms) { ms = +ms; this._recCalibMs = isFinite(ms) ? ms : 0; };
   Engine.prototype.getRecCalib = function () { return this._recCalibMs || 0; };
   Engine.prototype.recCalibSec = function () { return (this._recCalibMs || 0) / 1000; };
+  // Fix 1 (alignment) — map an audio-clock time to a fractional playhead tick using the live playhead
+  // anchor (_phPoint = {tick, time}, re-seeded on start/seek and constant-tempo linear between). Lets the
+  // App place a take from the ACTUAL first-captured-sample clock time (_cap.startedAt) instead of ASSUMING
+  // capture engaged exactly at the requested downbeat — removing the engage-gap (worklet quantum + arm
+  // latency) that left takes mis-placed even after the prior baseLatency/calibration fix.
+  Engine.prototype.tickAtTime = function (clockTime) {
+    var pp = this._phPoint;
+    if (!pp || !this.isPlaying) return this.playheadTick;
+    return pp.tick + (clockTime - pp.time) / this.secPerTick();
+  };
+  // exact audio-clock time the first captured sample was copied (set by the capture node at engage)
+  Engine.prototype.captureStartedAt = function () { return (this._cap && this._cap.startedAt) || 0; };
   // release the cached mic stream + capture nodes (session end / teardown)
   Engine.prototype.releaseMic = function () {
     var c = this._cap;
@@ -1173,13 +1194,55 @@
       if (!this._tlEvents) this._tlEvents = this.timelineEvents();
       this._tlCursor = this._cursorForTick(tick);
       if (this.isPlaying) {
+        // Fix 3 (scrub restacking): atomically stop EVERY currently-sounding lane + synth voice with a
+        // de-click ramp BEFORE re-seating, so no voice from the old position survives the jump (the old
+        // code only moved the cursor and let ringing buffers keep sounding -> stacking on every scrub).
+        this._killLaneVoices(); this._killSynthVoices();
         this.nextStepTime = this.ctx.currentTime + 0.03;   // re-anchor look-ahead
         // Phase 4: drop stale schedule points + re-seat the playhead anchor at the seek target so
         // the audio-clock-driven playhead snaps cleanly instead of drifting from the old position.
         this.notesInQueue = []; this._phPoint = { tick: tick, time: this.nextStepTime };
+        // Fix 2: resume any clip already in progress at the new position from the correct buffer offset,
+        // in sync. seek starts no repeating voices, so this kill+reschedule is idempotent per seek —
+        // rapid successive scrubs cannot stack.
+        this._scheduleSpanningClips(tick, this.nextStepTime);
       }
     }
     if (this.onPlayhead) this.onPlayhead(tick);
+  };
+  // Fix 2 (mid-position playback) — when playback starts or the playhead jumps to position P, fire any
+  // AUDIO clip that SPANS P (started before P and still sounding) from the correct buffer offset, so it
+  // sounds mid-clip and in sync. The per-tick scheduler only fires an event on its EXACT start tick, so a
+  // clip whose start is behind P would otherwise be skipped entirely (dropped track). One-shot pass:
+  // clips whose start is >= P are still handled by the normal scheduler (no double-trigger). Covers backing,
+  // audio lanes, and mirrored Producer content played through the timeline; also the count-in one-bar
+  // lead-in that lands mid-clip (it seeks there). Sustained MIDI/synth notes are out of scope (transient).
+  Engine.prototype._scheduleSpanningClips = function (P, time) {
+    if (this.playMode !== "timeline") return;
+    var evs = this._tlEvents || (this._tlEvents = this.timelineEvents());
+    var scoped = this._scopeActive;
+    for (var i = 0; i < evs.length; i++) {
+      var ev = evs[i];
+      if (ev.kind !== "audio") continue;
+      var buf = this.userBuffers[ev.bufferId]; if (!buf) continue;
+      var startT = ev.absTick;
+      // sounding length: trimmed/split clips stop on their grid boundary; an untrimmed clip runs to the
+      // buffer's natural end (mirrors _fireEvent's durSec logic).
+      var lenT = ev.trimmed ? (ev.lenTicks || 0)
+        : this.secToTick(buf.duration - this.tickToSec(ev.offsetTicks || 0));
+      if (!(startT < P && P < startT + lenT)) continue;            // only clips already in progress at P
+      if (!this._audible(ev.ch) || !this._inModeScope(ev.ch)) continue;
+      if (this._capLaneId && ev.ch === this._capLaneId && this.isMicCapturing()) continue;   // Fix 4: don't resume the record target's old take
+      if (scoped && this._scopeSoloId && ev.ch !== this._scopeSoloId) continue;              // honor a scoped audition solo
+      var ch = this.channels[ev.ch]; if (!ch) continue;
+      var send = this._overrideSend(ch, ev.routeOverride);
+      var into = this.tickToSec(P - startT);                       // seconds already elapsed into the clip
+      var offSec = this.tickToSec(ev.offsetTicks || 0) + into;     // static trim + the mid-clip offset
+      var dur = ev.trimmed ? Math.max(0.02, this.tickToSec(ev.lenTicks) - into) : 0;   // 0 = play to natural end
+      // fadeIn:0 — the clip's attack already elapsed before P; _playBuffer still applies a 3ms de-click.
+      this._playBuffer(this.ctx, buf, time, send || ch.gain, 0, 100, dur, offSec,
+        { gain: ev.gain, fadeIn: 0, fadeOut: this.tickToSec(ev.fadeOutTicks || 0) });
+    }
   };
   // one-shot preview of an already-decoded buffer (mirrors previewSample for real user files)
   Engine.prototype.previewBuffer = function (buffer) {
@@ -1362,6 +1425,11 @@
   Engine.prototype._fireEvent = function (ev, time) {
     if (!this._audible(ev.ch)) return;
     if (!this._inModeScope(ev.ch)) return;                        // mode-scoped: only the active tab's content sounds
+    // Fix 4 (punch-in auto-mute): while a mic capture is ACTIVELY recording onto a target lane, that
+    // lane's PRE-EXISTING clips are excluded from playback scheduling so the old take isn't heard under
+    // the new one (backing + other lanes play normally). Playback-side only — clip data, the user's mute
+    // flags, and the [M] button are all untouched; normal scheduling resumes when _capLaneId clears on stop.
+    if (this._capLaneId && ev.ch === this._capLaneId && this.isMicCapturing()) return;
     var ch = this.channels[ev.ch]; if (!ch) return;
     var send = this._overrideSend(ch, ev.routeOverride);   // null unless the clip overrides its route
     if (ev.kind === "audio") {
@@ -1458,6 +1526,9 @@
     // Phase 4: seed the playhead anchor (tick + the ctx time it will sound) so _draw can project
     // the live position straight off the audio clock from frame one.
     this._phPoint = { tick: this.playheadTick, time: this.nextStepTime };
+    // Fix 2: if the transport starts at a non-zero position (e.g. loop start), resume clips already in
+    // progress there from the correct buffer offset — same catch-up pass the scrub/seek path uses.
+    if (this.playMode === "timeline" && this.playheadTick > 0) this._scheduleSpanningClips(this.playheadTick, this.nextStepTime);
     this.timer = setInterval(function () { self._scheduler(); }, this.lookahead); this._draw();
   };
   Engine.prototype.pause = function () { this.isPlaying = false; if (this.timer) { clearInterval(this.timer); this.timer = null; } this._killLaneVoices(); this._killSynthVoices(); };   // Phase 8: silence ringing lane + synth voices with a de-click ramp
@@ -1938,7 +2009,7 @@
           var reps = fb > 0.01 ? (3 / Math.log10(1 / fb)) : 1;   // repeats to ~ -60 dB
           var tl = t * reps; if (tl > fxTail) fxTail = tl;
         } else if (s.type === "chorus") { if (0.1 > fxTail) fxTail = 0.1; }
-        else if (s.type === "reverb") { var rt = 0.4 + (s.params.size != null ? s.params.size : 0.6) * 3.6; if (rt > fxTail) fxTail = rt; }   // Fix 2: reverb tail rings out in the bounce
+        else if (s.type === "reverb") { var rt = 0.6 + (s.params.size != null ? s.params.size : 0.6) * 4.4; if (rt > fxTail) fxTail = rt; }   // Fix 6: reverb tail rings out in the bounce (matches the longer parity impulse; capped at 12s below)
       });
     });
     var tail = Math.min(12, Math.max(1.8, fxTail + 0.3));
@@ -1977,7 +2048,7 @@
       dry.gain.value = 1;
       // Fix 2: identical perceptual wet mapping as _applyFx so the bounce matches monitoring.
       if (delayish) { if (delayish.type === "chorus") { dl.delayTime.value = 0.022; fb.gain.value = 0.22; wet.gain.value = Math.pow((delayish.params.mix != null ? delayish.params.mix : 0.4), 0.6) * 1.1; } else { dl.delayTime.value = delayish.params.time; fb.gain.value = Math.min(0.92, delayish.params.fb); wet.gain.value = Math.pow((delayish.params.mix != null ? delayish.params.mix : delayish.params.wet), 0.6) * 1.25; } } else { fb.gain.value = 0; wet.gain.value = 0; }
-      if (reverbS) { var rsz = reverbS.params.size != null ? reverbS.params.size : 0.6; conv.buffer = self._makeImpulse(0.4 + rsz * 3.6, 1.6 + rsz * 2.6); var rvw = reverbS.params.wet != null ? reverbS.params.wet : (reverbS.params.mix != null ? reverbS.params.mix * 0.8 : 0.24); rvWet.gain.value = Math.pow(rvw / 0.8, 0.55) * 1.7; }
+      if (reverbS) { var rsz = reverbS.params.size != null ? reverbS.params.size : 0.6; conv.buffer = self._makeImpulse(0.6 + rsz * 4.4, 2.6); var rvw = reverbS.params.wet != null ? reverbS.params.wet : (reverbS.params.mix != null ? reverbS.params.mix * 0.8 : 0.24); rvWet.gain.value = rvw > 0 ? Math.pow(rvw / 0.8, 0.5) * 2.4 : 0; }   // Fix 6: identical parity mapping as _applyFx so the bounce matches monitoring
       input.connect(bit); bit.connect(filt); filt.connect(comp);
       comp.connect(dry); comp.connect(dl); dl.connect(fb); fb.connect(dl); dl.connect(wet);
       comp.connect(conv); conv.connect(rvWet);

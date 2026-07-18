@@ -5,6 +5,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Tracking & Editing Patch — Alignment Escalation · Scheduling · Punch-In · Undo/Redo
+Six fixes (two escalations). Engine (file 00) + App (file 10) + CSS (template); no protected-core changes.
+- **Fix 1 — Recording alignment (ESCALATION).** Prior pass dropped `baseLatency` + added an additive
+  per-session CAL(ms) calibration — both verified correct/wired. Residual persisted because placement
+  ASSUMED capture engaged exactly at the requested downbeat. Added `Engine.tickAtTime(clockTime)` +
+  `captureStartedAt()`; `placeTake` now anchors on the ACTUAL engage tick (from the first captured
+  sample's clock time) then applies `comp = measuredLatency + recCalibSec()`, and logs a compact
+  `[CR rec-align]` instrumentation trace per take (requested vs engage tick, latency terms, applied
+  comp, placed tick) so the residual is measured on-device, not guessed.
+- **Fix 2 — Mid-position playback.** New `Engine._scheduleSpanningClips(P,time)`: starting/seeking to P
+  now also fires any AUDIO clip already in progress at P from the correct buffer offset
+  (`src.start(t, into+trim)`), so a clip started before P is no longer skipped. Called from `start()`
+  (non-zero) and `seek()`; covers backing, audio lanes, and mirrored Producer timeline content.
+- **Fix 3 — Scrub restacking.** `seek()` now atomically `_killLaneVoices()`+`_killSynthVoices()` (de-click)
+  before re-seating, then reschedules spanning clips — no old voice survives a scrub; idempotent per seek
+  so rapid scrubs can't stack. All scrub handlers already funnel through `seek`.
+- **Fix 4 — Punch-in auto-mute.** `engine._capLaneId` (set by the App at capture engage, cleared on
+  stop/cancel) + a guard in `_fireEvent`/`_scheduleSpanningClips` schedule-EXCLUDE the record target's
+  prior clips while capture is ACTIVE. Playback-side only — clip data, user mute flags, and [M] untouched.
+- **Fix 5 — Marquee parity + undo/redo stack.** `.sm-range` restyled to match the Producer `.tl-marquee`
+  (flat accent fill + solid 1px accent border), keeping time-range semantics. The single-step session
+  recycle became a bounded (cap 50) undo/redo STACK (`recycleRef`+`redoRef`, symmetric `reverseEntry`);
+  new `studioRedo`; a new op clears the redo branch; ↶/↷ arrow buttons added to the Rec-Audio transport
+  (disabled when empty, tooltips); Ctrl/⌘+Shift+Z / Ctrl/⌘+Y wired for Studio redo.
+- **Fix 6 — Producer FX boost (ESCALATION).** The insert reverb reached live audio but was thin/quiet.
+  Ported the Studio convolver's implementation to the Producer inserts (`_applyFx` + `renderMixdown`
+  mirror + fxTail sizing): seconds-scaled impulse `_makeImpulse(0.6+size*4.4, 2.6)` (gentler tail) and a
+  higher wet ceiling (`pow(wet/0.8,0.5)*2.4`, wet=0.8 → 2.4). `wet=0` stays exactly dry (zero-state +
+  saved-project compatible). A/B render: 100%-wet tail RMS ≈ 0.031 / peak ≈ 0.20 over ~3.2s where the
+  identical dry pattern is silent.
+- Verified headless (Playwright on `vite preview` of dist): spanning fires/skips correctly, scrub kills+
+  reschedules (no stacking), capture excludes target lane while others play, undo↔redo cycle + new-op-
+  clears-redo + button disabled states, marquee CSS parity, dry-vs-wet A/B, Producer regression clean,
+  **0 console errors**. Manual on-device script (Fix 1 calibration + Fix 3 scrub) at
+  `MANUAL-TEST-TRACKING-EDITING-PATCH.md`. Local build only — no deploy.
+
 ### Added — Phase 5: Melody Maker (Polyphonic Pitch-Shifting Sampler)
 - **New track type `track.kind = 'polySampler'`** — a sample-to-piano-roll melodic
   voice. Implemented as a *sound-source variant* of the existing synth voice, **not a
