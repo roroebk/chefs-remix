@@ -5,6 +5,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Evidence-Required Diagnostic — three persistent failures (recording delay · bar-range delete · punch-in bleed)
+Reproduced each with runtime evidence before editing; Rule Zero confirmed both the local and deployed
+builds already carried the prior fixes (so all three were "code present, behavior still wrong" — not a
+ship gap). Engine (file 00, additive only — no scheduler/routing change) + App (file 10).
+- **Failure 1 — recording delay (3rd escalation): FIXED.** Root cause found by driving the real capture
+  flow with the `[CR rec-align]` trace: the default record position (red line in bar 1, incl. tick 0)
+  used the `rollAtEngage` branch, which started the backing at engage with a `start()`/`seek()` look-ahead
+  (+0.03s) the pre-armed capture `engageTime` never shared — so the backing sounded ~30–40 ms AFTER
+  capture engaged (`engageGapMs -41`), while a bar-≥2 punch-in was already `+2`. Prior passes only fixed
+  the pre-roll path. Fix (App `startCaptureFlow`): pre-schedule the backing so tick `start` first sounds
+  at the SAME `engageTime` the capture is armed for. Verified: default-position `engageGapMs -41 → 0`;
+  bar-3 punch-in unchanged at `+2`. The `[CR rec-align]` trace is now behind `window.CR_DEBUG_ALIGN`.
+- **Failure 3 — punch-in bleed: FIXED.** An existing take sounding across the punch point had its buffer
+  voice started at the pre-roll `seek` (before `_capLaneId`/`isMicCapturing`), and the schedule-time guard
+  can't stop an already-started one-shot — so it played into the take (`takeVoicesLive=1` at engage). No
+  per-lane voice kill existed. Added `Engine._killLaneVoicesFor(chId)` (mirrors `_killLaneVoices`, filters
+  by a new `voice.ch` tag set in `_playBuffer`, threaded from the two timeline audio schedule sites);
+  `startCaptureFlow` onEngage calls it on the target lane. Verified: old-take voices `1 → 0` at engage,
+  other lanes untouched (`1`).
+- **Failure 2 — bar-range delete: core verified functional + edge fixed.** Genuine right-drag reproduction
+  showed the range→split→recycle path is correct (clip at 0 and mid-timeline both split cleanly). The one
+  reproducible defect: the red punch-in line (a sibling of the lanes) intercepted right-drags begun on it,
+  so no range was set and Delete fell through to whole-track delete (`deleteModal` opened). Fix (App):
+  `studioRangeDown` resolves the lane body via `elementsFromPoint` (robust when the drag starts on a clip
+  child or the playhead), the lane body carries `data-lane`, and the red-line `onMouseDown` forwards a
+  right-button press to the range gesture. Verified: right-drag on the red line now creates a range +
+  splits (no track-delete modal); normal range-delete and no-range whole-track delete both intact.
+- Producer regression + full-session sweep: **0 console errors**. Local build only — not committed/deployed.
+
 ### Tracking & Editing Patch — Alignment Escalation · Scheduling · Punch-In · Undo/Redo
 Six fixes (two escalations). Engine (file 00) + App (file 10) + CSS (template); no protected-core changes.
 - **Fix 1 — Recording alignment (ESCALATION).** Prior pass dropped `baseLatency` + added an additive

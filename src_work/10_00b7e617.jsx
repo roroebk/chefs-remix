@@ -648,7 +648,17 @@
           onMouseDown: function (e) { props.dragScrub(e, function (ev) { return laneFrac(ev.clientX); }); } }) : null,
         h("div", { className: "sm-playhead rec" + (redDraggable ? " grab" : ""), style: phLeft(redTick / fit),
           title: recording ? "Recording — write position" : "Record-start (punch-in) — drag to move",
-          onMouseDown: redDraggable ? function (e) { props.dragRed(e, function (ev) { return laneFrac(ev.clientX); }); } : null }),
+          // Fix B (range never starts): the red punch-in line overlaps the lanes and would otherwise EAT a
+          // right-drag that begins on it (leaving no range → Delete nukes the whole track). Forward a
+          // right-button press to the range gesture for whichever lane body sits under the pointer.
+          onMouseDown: function (e) {
+            if (e.button === 2) {
+              var stack = document.elementsFromPoint(e.clientX, e.clientY);
+              for (var si = 0; si < stack.length; si++) { var el = stack[si]; if (el.classList && el.classList.contains("sm-lanebody") && el.getAttribute("data-lane")) { e.preventDefault(); props.onRangeDown(e, el.getAttribute("data-lane")); return; } }
+              return;
+            }
+            if (redDraggable) props.dragRed(e, function (ev) { return laneFrac(ev.clientX); });
+          } }),
         lanes.length
           ? lanes.map(function (c) {
               var clips = E.timeline.clips.filter(function (cl) { return cl.ch === c.id && cl.kind === "audio"; });
@@ -667,6 +677,7 @@
                 // auto-fit lane body: every clip is time-positioned by the SHARED scale (left/width = % of
                 // fitTicks), so a given x = the same timestamp on every lane. No horizontal overflow.
                 h("div", { className: "sm-lanebody" + ((clips.length || live) ? "" : " empty") + (rng ? " ranging" : ""),
+                    "data-lane": c.id,
                     // Fix B — right-drag anywhere on a (non-backing) lane body selects a snapped TIME RANGE
                     // on THAT lane; onContextMenu is suppressed so the browser menu never eats the gesture.
                     onMouseDown: backing ? null : function (e) { if (e.button === 2) { e.preventDefault(); props.onRangeDown(e, c.id); } },
@@ -1146,7 +1157,17 @@
       var d = E.channels[laneId] ? E.channels[laneId].def : null;
       if (!d || isBackingDef(d)) return;                               // backing/Project lanes are inert
       setSelClip(null);                                                // range + clip selection are mutually exclusive
-      var body = e.currentTarget, r = body.getBoundingClientRect();
+      // Fix B (range never starts): resolve the lane BODY rect from what's actually under the pointer, not
+      // e.currentTarget. A right-drag can begin on a clip child OR on the red punch-in playhead line (a
+      // sibling of the lanes that visually overlaps them) — in those cases currentTarget is not the
+      // .sm-lanebody, so its rect gave a wrong tick mapping (or the gesture never fired and Delete fell
+      // through to whole-track delete). elementsFromPoint returns the lanebody even when it sits beneath.
+      var body = e.currentTarget;
+      if (!(body && body.classList && body.classList.contains("sm-lanebody"))) {
+        var stack = document.elementsFromPoint(e.clientX, e.clientY);
+        for (var si = 0; si < stack.length; si++) { if (stack[si].classList && stack[si].classList.contains("sm-lanebody")) { body = stack[si]; break; } }
+      }
+      var r = body.getBoundingClientRect();
       var maxT = fitTicksRef.current || studioSessionTicks();
       function tickAt(ev) { var f = Math.max(0, Math.min(1, (ev.clientX - r.left) / Math.max(1, r.width))); return studioSnap(f * maxT); }
       var a = tickAt(e);
@@ -1310,26 +1331,39 @@
           // one-bar lead-in and capture engages when the playhead reaches the line (4 beats later). If the
           // line sits inside bar 1 (incl. the default 0), the count-in is clicks-only and the backing +
           // capture start TOGETHER on the downbeat. Either way it's 4 clicks + a 1-2-3-4 flash.
-          var t0, engageTime, rollAtEngage;
+          var t0, engageTime;
           if (start >= TPB) {
             E.start("timeline"); E.seek(start - TPB);          // roll from one bar before; start() resets, seek re-anchors _phPoint
             t0 = (E._phPoint && E._phPoint.time) || (E.ctx.currentTime + 0.06);
             engageTime = t0 + 4 * beatSec;                     // playhead reaches `start` exactly here
-            rollAtEngage = false;
           } else {
-            t0 = E.ctx.currentTime + 0.12;                     // clicks only; transport idle through the count-in
+            // Fix 1 (alignment ESCALATION #3 — takes recorded EARLY at the default red line): pre-schedule
+            // the backing so tick `start` FIRST SOUNDS at the SAME engageTime the capture is armed for, so
+            // the downbeat and capture-engage share ONE clock instant. The prior code deferred the backing
+            // start to onEngage, where start()/seek() add a fresh +0.03s look-ahead the pre-armed capture
+            // engageTime never shared — so the backing sounded ~30-40ms AFTER capture engaged (measured
+            // engageGap ≈ -41ms at the default position vs +2ms when pre-rolling from a full bar). Starting
+            // here (isPlaying true, but nothing is scheduled until engageTime) keeps the count-in audibly
+            // clicks-only, then the backing + capture begin together on the downbeat.
+            t0 = E.ctx.currentTime + 0.12;
             engageTime = t0 + 4 * beatSec;
-            rollAtEngage = true;
+            E.start("timeline"); E.seek(start);
+            E.nextStepTime = engageTime; E._phPoint = { tick: start, time: engageTime }; E.notesInQueue = [];
           }
           for (var i = 0; i < 4; i++) flow.oscs.push(E.metronomeClick(t0 + i * beatSec, i === 0));   // 4 tempo-synced clicks
           // arm sample-accurate engagement; onEngage fires from the capture node the instant copying begins
           E.beginMicCapture(engageTime, function () {
             if (flow.cancelled) return;
-            if (rollAtEngage) { E.start("timeline"); E.seek(start); }   // backing begins WITH capture on the downbeat
             // Fix 4 (punch-in auto-mute): tag the record-target lane so the scheduler schedule-excludes its
             // PRIOR clips while capture is ACTIVE (playback-side only; user mute flags untouched; cleared on
             // finish/cancel). Backing + other lanes keep playing.
             E._capLaneId = flow.laneId;
+            // Fix 4 (punch-in BLEED): stop any of the target lane's OWN voices that already started during
+            // the pre-roll/count-in — the scheduler guard only blocks NEW scheduling once capture is active,
+            // so a take sounding across the punch point (its buffer voice started at the pre-roll seek,
+            // before _capLaneId was set) would otherwise play straight into the capture. Backing + other
+            // lanes are untouched.
+            if (E._killLaneVoicesFor) E._killLaneVoicesFor(flow.laneId);
             // Fix 1 (alignment ESCALATION): capture the ACTUAL engage tick from the first-captured-sample
             // clock time (_cap.startedAt) rather than assuming capture engaged exactly at the requested
             // downbeat. Sampled here, at engage, while the playhead anchor (_phPoint) is fresh.
@@ -1397,9 +1431,10 @@
       // fix. `engageTick` removes that gap; `comp` still trims the input-path delay + per-device calibration.
       var engageTick = (flow && flow.engageTick != null) ? flow.engageTick : captureTick;
       var startTick = Math.max(0, Math.round(engageTick - E.secToTick(comp)));          // latency compensation (rule 6)
-      // INSTRUMENTATION (Fix 1 Phase-0): one compact trace per take so the residual delay can be MEASURED
-      // on-device, not guessed (the manual test uses these numbers to dial CAL by ear).
-      try {
+      // INSTRUMENTATION (Fix 1): one compact trace per take so the residual delay can be MEASURED on-device,
+      // not guessed (the manual test uses these numbers to dial CAL by ear). Behind a debug flag — set
+      // `window.CR_DEBUG_ALIGN = true` in the console to enable (off by default so takes don't spam the log).
+      if (window.CR_DEBUG_ALIGN) try {
         var spt = E.secPerTick();
         console.log("[CR rec-align]", {
           bpm: E.getBPM(), requestedTick: Math.round(captureTick), engageStartedAt: result.startedAt || 0,

@@ -408,7 +408,12 @@
     try { src.stop(t + playDur + 0.02); } catch (e) {}   // tail past the release so the ramp completes
     // Phase 8: track LIVE voices only (never the offline render ctx) so pause/stop can silence them.
     if (ctx === this.ctx) {
-      var self = this, voice = { src: src, gain: g };
+      // Fix 4 (punch-in bleed): tag the voice with its lane/channel id so a mic-capture engage can
+      // silence ONLY the record target's already-sounding voices (see _killLaneVoicesFor). The
+      // scheduler-time guard in _fireEvent/_scheduleSpanningClips only blocks NEW scheduling once
+      // capture is active; a voice started during the pre-roll/count-in (before _capLaneId is set)
+      // would otherwise keep playing straight into the take. Untagged callers pass no laneId (null).
+      var self = this, voice = { src: src, gain: g, ch: opts.laneId != null ? opts.laneId : null };
       this._laneVoices.push(voice);
       src.onended = function () { var k = self._laneVoices.indexOf(voice); if (k >= 0) self._laneVoices.splice(k, 1); };
     }
@@ -433,6 +438,29 @@
         v.src.stop(now + R + 0.01);
       } catch (e) {}
     }
+  };
+  // Fix 4 (punch-in bleed): synchronously de-click + stop ONLY the buffer voices belonging to one
+  // lane/channel (mirrors _killLaneVoices' ramp-then-stop). Called at mic-capture engage on the record
+  // target so a pre-existing take that was already sounding across the punch point (its voice started
+  // during the pre-roll/count-in, before the scheduler guard applies) is silenced — leaving the backing
+  // and every other lane untouched. Voices for other lanes are kept in _laneVoices.
+  Engine.prototype._killLaneVoicesFor = function (chId) {
+    var ctx = this.ctx; if (!ctx || chId == null) return;
+    var now = ctx.currentTime, R = 0.008, vs = this._laneVoices, keep = [];
+    for (var i = 0; i < vs.length; i++) {
+      var v = vs[i];
+      if (v.ch !== chId) { keep.push(v); continue; }
+      try {
+        var g = v.gain.gain;
+        g.cancelScheduledValues(now);
+        var cur = g.value; if (!(cur > 0.0001)) cur = 0.0001;
+        g.setValueAtTime(cur, now);
+        g.linearRampToValueAtTime(0.0001, now + R);
+        v.src.onended = null;
+        v.src.stop(now + R + 0.01);
+      } catch (e) {}
+    }
+    this._laneVoices = keep;
   };
   // ---- Synth Suite (Phase 1): native polyphonic oscillator synth -----------
   // A real-time synthesis source for kind:'synth' tracks. One OscillatorNode per note (Saw /
@@ -1241,7 +1269,7 @@
       var dur = ev.trimmed ? Math.max(0.02, this.tickToSec(ev.lenTicks) - into) : 0;   // 0 = play to natural end
       // fadeIn:0 — the clip's attack already elapsed before P; _playBuffer still applies a 3ms de-click.
       this._playBuffer(this.ctx, buf, time, send || ch.gain, 0, 100, dur, offSec,
-        { gain: ev.gain, fadeIn: 0, fadeOut: this.tickToSec(ev.fadeOutTicks || 0) });
+        { gain: ev.gain, fadeIn: 0, fadeOut: this.tickToSec(ev.fadeOutTicks || 0), laneId: ev.ch });
     }
   };
   // one-shot preview of an already-decoded buffer (mirrors previewSample for real user files)
@@ -1441,7 +1469,7 @@
       var dur = ev.trimmed ? this.tickToSec(ev.lenTicks) : 0;
       this._playBuffer(this.ctx, this.userBuffers[ev.bufferId], time, send || ch.gain, 0, 100,
         dur, this.tickToSec(ev.offsetTicks || 0),
-        { gain: ev.gain, fadeIn: this.tickToSec(ev.fadeInTicks || 0), fadeOut: this.tickToSec(ev.fadeOutTicks || 0) });
+        { gain: ev.gain, fadeIn: this.tickToSec(ev.fadeInTicks || 0), fadeOut: this.tickToSec(ev.fadeOutTicks || 0), laneId: ev.ch });
       return;
     }
     var semis = ev.pitch - (ch.def.base || 0);
